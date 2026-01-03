@@ -1,115 +1,184 @@
-import asyncio
-import textwrap
-from typing import List
-import os
+from keep_alive import keep_alive # NEW
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
+from discord.ui import Button, View
+import asyncio
 import random
-import aiohttp
+from openai import OpenAI
+from collections import defaultdict
+import os
+import datetime
+import requests
 import json
 import time
-from datetime import datetime, timedelta
-import requests
-from hide_game import run_grand_escape_round, get_status_message, HIDING_SPOTS
+from dotenv import load_dotenv
+from cooldowns import check_cooldowns
+from hide_game import run_grand_escape_round, get_status_message
+import io
+from dateutil import parser
+import re
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import socket
+import google.generativeai as genai
+import aiohttp
 
-import logging
+# Load environment variables
+load_dotenv()
 
-# Discord webhook URL for notifications
-WEBHOOK_URL = "https://discord.com/api/webhooks/1444058241205014581/s9NxY2a2jn3GnKshVThgnNaQgpLV1WFcEWpCPGIgT9pQgaJxetdyrlz0hDrtPdp4MmMV"
-
-# Load environment variables from .env
-load_dotenv(dotenv_path='../.env')
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# Validate runtime secrets early
-if not DISCORD_BOT_TOKEN:
-    raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment. Set it in .env")
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("Missing OPENROUTER_API_KEY in environment. Set it in .env")
-
-# Lazy import to avoid dependency import errors if not installed yet
+# Initialize YouTube client
 try:
-    from openai import OpenAI, OpenAIError
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
-    OpenAIError = None  # type: ignore
+    youtube = build('youtube', 'v3', developerKey=os.getenv('YOUTUBE_API_KEY'))
+except Exception:
+    youtube = None
 
-# Discord intents
-intents = discord.Intents.default()
-intents.message_content = True  # Required if you want to read message content for prefix commands
-intents.members = True
-intents.invites = True
+# Initialize Cerebras client (OpenAI-compatible)
+ai_client = OpenAI(
+    base_url="https://api.cerebras.ai/v1",
+    api_key=os.getenv('CEREBRAS_API_KEY')
+)
 
-# Create bot with prefix and application command tree for slash commands
-bot = commands.Bot(command_prefix=commands.when_mentioned_or("j!"), intents=intents, help_command=None)
+# Initialize Gemini AI for image recognition
+gemini_api_key = os.getenv('GEMINI_API_KEY')
+if gemini_api_key:
+    genai.configure(api_key=gemini_api_key.strip().strip('"').strip("'"))
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+else:
+    gemini_model = None
 
-tree = bot.tree  # app_commands.CommandTree
+async def get_image_bytes(url):
+    """Downloads the image from Discord's servers"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            return None
 
-# Helper: chunk long strings to respect Discord 2000 char message limit
-MAX_DISCORD_MSG = 2000
+# Custom status function
+async def set_custom_status(status_text: str, emoji: str = None):
+    """Sets a true Custom Status (no 'Playing' prefix)."""
+    activity = discord.CustomActivity(name=status_text, emoji=emoji)
+    await bot.change_presence(activity=activity)
+    return f"Custom status set to: {status_text}"
 
-def chunk_text(s: str, size: int = MAX_DISCORD_MSG) -> List[str]:
-    chunks: List[str] = []
-    s = s.replace("\r\n", "\n")
-    while s:
-        if len(s) <= size:
-            chunks.append(s)
-            break
-        # Try to break on newline or space near boundary for nicer formatting
-        cut = s.rfind("\n", 0, size)
-        if cut == -1:
-            cut = s.rfind(" ", 0, size)
-        if cut == -1:
-            cut = size
-        chunks.append(s[:cut])
-        s = s[cut:].lstrip(" \n")
-    return chunks
+# Tool definition for AI
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_custom_status",
+            "description": "Sets a custom text status for the bot. Use this when the user asks you to change your status text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status_text": {
+                        "type": "string", 
+                        "description": "The text the status should show (e.g., 'Feeling sleepy' or 'Vibing')"
+                    },
+                    "emoji": {
+                        "type": "string", 
+                        "description": "A single emoji character to display with the status (optional)"
+                    }
+                },
+                "required": ["status_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_interface",
+            "description": "Creates an interactive button interface. Use this when the user asks for buttons, menus, or interactive elements.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string", 
+                        "description": "The message to display with the interface"
+                    },
+                    "button_label": {
+                        "type": "string", 
+                        "description": "The text on the button"
+                    },
+                    "button_emoji": {
+                        "type": "string", 
+                        "description": "Emoji for the button (optional)"
+                    }
+                },
+                "required": ["message", "button_label"]
+            }
+        }
+    }
+]
 
-# AI client factory
-_client = None
+class MyInterface(View):
+    def __init__(self, label="Click Me!", emoji="🚀"):
+        super().__init__()
+        self.label = label
+        self.emoji = emoji
+        
+    @discord.ui.button(label="Click Me!", style=discord.ButtonStyle.primary, emoji="🚀")
+    async def button_callback(self, interaction: discord.Interaction, button: discord.Button):
+        await interaction.response.send_message("Interface Updated!", ephemeral=True)
 
-def get_ai_client():
-    global _client
-    if _client is None:
-        if OpenAI is None:
-            raise RuntimeError("openai package is not available. Install dependencies with 'pip install -r requirements.txt'")
-        _client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY
-        )
-    return _client
+async def create_interface(message: str, button_label: str, button_emoji: str = "🚀"):
+    """Creates an interactive button interface."""
+    view = MyInterface(button_label, button_emoji)
+    return message, view
 
-ASYNC_TIMEOUT = 60
+# Memory storage: Stores last 5 messages per user to keep context
+# Format: {user_id: [messages]}
+user_memory = defaultdict(list)
 
-async def ask_openai(prompt: str, user: str) -> str:
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_ask_openai_sync, prompt, user), timeout=ASYNC_TIMEOUT)
-    except asyncio.TimeoutError:
-        return f"Sorry {user}, the AI took too long to respond. Try again."
+# AI mention cooldown storage
+ai_cooldowns = {}
 
-def _ask_openai_sync(prompt: str, user: str) -> str:
-    client = get_ai_client()
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant in a Discord server. Keep answers concise unless asked for detail."},
-                {"role": "user", "content": f"User: {user}\nQuestion: {prompt}"},
-            ],
-            temperature=0.7,
-            max_tokens=800,
-        )
-        content = resp.choices[0].message.content or "(No content returned)"
-        return content.strip()
-    except OpenAIError as e:
-        if "quota" in str(e).lower() or "exceeded" in str(e).lower() or "insufficient_quota" in str(e):
-            return f"Sorry {user}, the AI service is currently unavailable due to quota limits. Please try again later."
-        return f"Error from AI service: {e}"
-    except Exception as e:
-        return f"An unexpected error occurred: {e}"
+# Global AI response cooldown (5 seconds)
+global_ai_cooldown = 0
+
+# Configuration
+BOT_NAME = "Synapse"
+OWNER_ID = 1231525871257649213  # Your specific ID
+COOLDOWN_TIME = 10
+ANNOUNCE_FILE = 'announce_channels.json'
+
+# User cooldowns for bot mentions - increased cooldown time
+user_cooldowns = {}
+user_last_message = {}  # Track last message content to prevent duplicates
+processing_users = set()  # Track users currently being processed to prevent spam
+user_locks = {}  # Dictionary to store a unique lock for every user
+processing_lock = asyncio.Lock()  # Global lock to prevent multiple overlapping responses
+
+# Bot busy state
+is_busy = False
+
+# Banned users from using the bot
+banned_users = {1219625604740026378}
+
+# Track if banned users have been notified
+notified_banned_users = set()
+
+class MyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.invites = True
+        intents.presences = True
+        intents.guilds = True
+        intents.messages = True
+        super().__init__(command_prefix="j!", intents=intents)
+        # Dictionary to store the last deleted message per channel
+        # Format: {channel_id: message_data_object}
+        self.deleted_messages = {}
+
+    async def setup_hook(self):
+        # This syncs your slash commands with Discord
+        await self.tree.sync()
+        print(f"Synced slash commands for {self.user}")
+
+bot = MyBot()
 
 # AFK storage
 afk_users = {}
@@ -126,44 +195,24 @@ invite_tracking = {}  # guild_id -> {'invites': {code: invite_data}, 'joins': [j
 # Announcement channel storage (in-memory)
 announce_channels = {}  # guild_id -> channel_id
 
-# Tester responses storage (in-memory)
-tester_responses = {}  # user_id -> {'accepted': bool, 'timestamp': str}
+# Welcome channel storage (in-memory)
+welcome_channels = {}  # guild_id -> channel_id
 
+# Welcome message cooldown per guild (to prevent spam)
+welcome_cooldowns = {}  # guild_id -> last_welcome_time
 
+# New Year message tracking
+new_year_sent = False  # Has the message been sent?
 
-# UI for tester notification
-class TesterResponseView(discord.ui.View):
-    def __init__(self, user_id: int):
-        super().__init__(timeout=None)  # No timeout for persistent buttons
-        self.user_id = user_id
+# Global check for banned users on slash commands
+@bot.tree.interaction_check
+async def interaction_check(interaction: discord.Interaction) -> bool:
+    return interaction.user.id not in banned_users
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, emoji="✅")
-    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This is not for you!", ephemeral=True)
-            return
-
-        tester_responses[self.user_id] = {'accepted': True, 'timestamp': datetime.utcnow().isoformat()}
-        embed = discord.Embed(
-            title="✅ Accepted!",
-            description="Thank you for accepting the app test request! Our developers will be in touch soon.",
-            color=discord.Color.green()
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, emoji="❌")
-    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This is not for you!", ephemeral=True)
-            return
-
-        tester_responses[self.user_id] = {'accepted': False, 'timestamp': datetime.utcnow().isoformat()}
-        embed = discord.Embed(
-            title="❌ Declined",
-            description="You have declined the app test request. Thank you for your consideration!",
-            color=discord.Color.red()
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
+# Global check for banned users on prefix commands
+@bot.check
+async def global_ban_check(ctx):
+    return ctx.author.id not in banned_users
 
 # Owner-only check using OWNER_ID env var (if set). Falls back to commands.is_owner().
 def owner_only():
@@ -181,16 +230,9 @@ def owner_only():
 # Event: Bot is ready
 @bot.event
 async def on_ready():
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands")
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
-    print(f"Logged in as: {bot.user} (ID: {bot.user.id})")
-    custom_text = "👑 Clash Royale"
-    custom_activity = discord.CustomActivity(name=custom_text)
-    await bot.change_presence(status=discord.Status.online, activity=custom_activity)
-
+    # Only log connection info when ready. Disabled automatic 'hue' message.
+    print(f'{bot.user} has connected to Discord!')
+    print(f'Bot is in {len(bot.guilds)} guilds')
     # Fetch invites for tracking
     for guild in bot.guilds:
         try:
@@ -198,6 +240,19 @@ async def on_ready():
             invite_tracking[guild.id] = {'invites': {inv.code: {'inviter': inv.inviter.id if inv.inviter else None, 'uses': inv.uses} for inv in invites}, 'joins': []}
         except Exception as e:
             print(f"Failed to fetch invites for {guild.name}: {e}")
+
+    # Load announce channels from file
+    try:
+        with open(ANNOUNCE_FILE, 'r') as f:
+            announce_channels.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    # Ensure the bot shows as online with a helpful activity
+    try:
+        await bot.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="/help", state="Ping me to start a conversation!"))
+    except Exception:
+        # If for some reason presence can't be changed right away, ignore and continue
+        pass
 
     # Send online announcement to configured channels
     for guild in bot.guilds:
@@ -211,10 +266,154 @@ async def on_ready():
                         description=f"{bot.user.mention} is now online and ready to serve!",
                         color=discord.Color.green()
                     )
-                    embed.set_footer(text=f"Connected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                    embed.set_footer(text=f"Connected at {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
                     await channel.send(embed=embed)
                 except Exception as e:
                     print(f"Failed to send online announcement in {guild.name}: {e}")
+
+    # Send New Year message immediately if date matches
+    # bot.loop.create_task(send_new_year_now())
+
+    # Start New Year check task
+    # bot.loop.create_task(check_new_year())
+
+# Event: Message handling
+@bot.event
+async def on_message(message):
+    global global_ai_cooldown
+    # 1. Ignore if the message is from the bot itself
+    if message.author == bot.user:
+        return
+
+    # Check if message starts with command prefix
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
+        return
+
+    # 2. Check if the bot was pinged/mentioned
+    if bot.user.mentioned_in(message):
+        user_id = message.author.id
+
+        # 3. Error Handling: Check if we are already talking to this user
+        if user_id in processing_users:
+            return # Simply ignore the second ping
+
+        try:
+            # Add user to the "lock" set
+            processing_users.add(user_id)
+
+            async with message.channel.typing():
+                # --- YOUR AI LOGIC GOES HERE ---
+                # Clean the message (remove mentions in guilds, keep full text in DMs)
+                if message.guild:
+                    clean_text = message.content.replace(f'<@!{bot.user.id}>', '').replace(f'<@{bot.user.id}>', '').strip()
+                else:
+                    clean_text = message.content.strip()
+
+                # Check for image attachments
+                image_data = None
+                attachment = None
+                if message.attachments:
+                    attachment = message.attachments[0]
+                    if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp']):
+                        image_data = await get_image_bytes(attachment.url)
+
+                if not clean_text and not image_data:
+                    await message.reply("Hey! You pinged me! How can I help? 😊")
+                    # Update global cooldown after response
+                    global_ai_cooldown = time.time()
+                    return
+
+                # Memory clear command
+                if clean_text.lower() == "forget me":
+                    user_memory[user_id] = []
+                    await message.reply("Memory cleared! What's on your mind now?")
+                    return
+
+                # Try AI response
+                owner_status = "You are talking to your creator." if user_id == OWNER_ID else "The user is not your creator."
+
+                # Handle image + text or just image
+                if image_data and gemini_model:
+                    try:
+                        prompt = clean_text if clean_text else "Describe this image in detail."
+                        contents = [
+                            prompt,
+                            {"mime_type": attachment.content_type, "data": image_data}
+                        ]
+                        response = await asyncio.wait_for(
+                            asyncio.to_thread(gemini_model.generate_content, contents),
+                            timeout=30.0
+                        )
+                        ai_reply = response.text
+                    except Exception as e:
+                        print(f"Gemini Error: {e}")
+                        ai_reply = "I can see you sent an image, but I'm having trouble analyzing it right now! 📸😅"
+                else:
+                    # Text-only response using Cerebras
+                    full_prompt = f"""You are Synapse, a friendly and casual AI assistant created by your owner with Discord ID {OWNER_ID}.
+
+IMPORTANT: The user you are talking to right now has Discord ID {user_id}. {owner_status}
+
+If this user's ID matches {OWNER_ID}, they are your creator and owner - be extra friendly and casual with them.
+Personality: Be casual, friendly, and conversational! Use emojis naturally. Talk like you're chatting with a friend.
+
+User: {clean_text}"""
+
+                    # Build messages with memory for better context
+                    if user_id not in user_memory:
+                        user_memory[user_id] = []
+
+                    messages = [{"role": msg["role"], "content": msg["content"]} for msg in user_memory[user_id]] + [
+                        {"role": "system", "content": f"You are Synapse, a friendly AI assistant. {owner_status}"},
+                        {"role": "user", "content": clean_text}
+                    ]
+
+                    response = await make_ai_request(messages=messages, max_tokens=200, temperature=0.7)
+
+                    ai_reply = response.choices[0].message.content
+
+                    # Store conversation in memory
+                    user_memory[user_id].append({"role": "user", "content": clean_text, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+                    user_memory[user_id].append({"role": "assistant", "content": ai_reply, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+                    # Keep only last 20 messages (10 exchanges)
+                    if len(user_memory[user_id]) > 20:
+                        user_memory[user_id] = user_memory[user_id][-20:]
+
+                await message.reply(ai_reply)
+                # Update global cooldown after successful response
+                global_ai_cooldown = time.time()
+                # -------------------------------
+
+        except Exception as e:
+            print(f"AI Error: {e}")
+            fallback_responses = [
+                "Hey! Having some tech issues right now, but I'm still here! 😅",
+                "Oops! My brain is taking a coffee break! ☕",
+                "Sorry dude, connection hiccups right now!"
+            ]
+            await message.reply(random.choice(fallback_responses))
+            return
+        finally:
+            # 4. Always remove the user from the set, even if the AI fails
+            processing_users.remove(user_id)
+
+    # Required to allow other @bot.commands to work
+    # await bot.process_commands(message)  # Moved to conditional above
+
+# Event: Message deletion witness
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot:
+        return
+
+    # Store message details in our bot's memory
+    bot.deleted_messages[message.channel.id] = {
+        "content": message.content or "*(No text content - possibly an image or embed)*",
+        "author": message.author,
+        "time": message.created_at,
+        "channel": message.channel.name
+    }
 
 # Event: Member joins the server
 @bot.event
@@ -246,7 +445,7 @@ async def on_member_join(member):
                     invite_tracking[guild_id]['joins'].append({
                         'user_id': member.id,
                         'inviter_id': inviter_id,
-                        'timestamp': datetime.utcnow().isoformat(),
+                        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         'invite_code': code
                     })
                     # Update uses
@@ -259,22 +458,28 @@ async def on_member_join(member):
     if quiet_mode:
         return  # Quiet mode, skip welcome message
 
-    # Send DM to new member about app testing
-    try:
-        dm_message = (
-            f"Hello {member.name},\n\n"
-            "Welcome to the server! It looks like you joined via an invite, which means you might be interested in our **App Test Program**!\n"
-            "Our developers will be in touch shortly with an invitation to the private testing server or additional instructions.\n"
-            "Thank you for helping us improve our app!"
-        )
-        await member.send(dm_message)
-    except discord.Forbidden:
-        # User has DMs disabled, skip
-        pass
-    except Exception as e:
-        print(f"Failed to send DM to {member}: {e}")
+    # Create a mock message for cooldown check
+    class MockMessage:
+        def __init__(self, author, channel):
+            self.author = author
+            self.channel = channel
 
-    channel = member.guild.system_channel
+    # Get the specific welcome channel
+    welcome_channel_id = welcome_channels.get(guild_id)
+    if welcome_channel_id is None:
+        return  # No welcome channel set, skip welcome message
+
+    channel = member.guild.get_channel(welcome_channel_id)
+
+    if channel is None:
+        return  # Channel not found, skip welcome message
+
+    mock_message = MockMessage(member, channel)
+
+    # Check cooldowns before sending welcome message
+    if check_cooldowns(mock_message):
+        return  # Rate limited, skip welcome message
+
     if channel is not None:
         try:
             await channel.send(f'Welcome {member.mention} to the server!')
@@ -285,78 +490,7 @@ async def on_member_join(member):
             else:
                 raise
 
-@bot.event
-async def on_message(message):
-    # Ignore messages from bots (including itself)
-    if message.author.bot:
-        return
 
-    # Check if user is AFK and remove status
-    if message.author.id in afk_users:
-        del afk_users[message.author.id]
-        embed = discord.Embed(
-            title="Welcome Back",
-            description="Your AFK status has been removed.",
-            color=discord.Color.green()
-        )
-        await message.channel.send(embed=embed)
-
-    # Ensure other commands still process
-    await bot.process_commands(message)
-
-# Slash command: /ask
-@tree.command(name="ask", description="Ask the AI a question")
-@app_commands.describe(prompt="Your question or message for the AI")
-async def ask(interaction: discord.Interaction, prompt: str):
-    await interaction.response.defer(thinking=True, ephemeral=False)
-    # Safety: bound prompt length to avoid abuse
-    prompt = prompt.strip()
-    if len(prompt) > 4000:
-        prompt = prompt[:4000]
-    answer = await ask_openai(prompt, user=interaction.user.name)
-    for part in chunk_text(answer):
-        await interaction.followup.send(part)
-
-# Slash command: /talk
-@tree.command(name="talk", description="Repeat your message")
-@app_commands.describe(message="Your message to repeat")
-async def talk(interaction: discord.Interaction, message: str):
-    # Safety: bound message length to avoid abuse
-    message = message.strip()
-    if len(message) > 4000:
-        message = message[:4000]
-    await interaction.response.send_message(message)
-
-# Slash command: /help
-@tree.command(name="help", description="Get help with bot commands")
-async def help_command(interaction: discord.Interaction):
-    help_text = """
-**Available Commands:**
-- `/ask <question>`: Ask the AI a question
-- `/talk <message>`: Send the message in the prompt
-- `/sync`: Sync all slash commands globally (admin only)
-- `j!ask <question>`: Prefix command to ask the AI
-- `j!talk <message>`: Prefix command to talk to the AI
-- `/image <prompt>`: Generate an image
-- `/game`: Play a game
-- And many more...
-    """
-    await interaction.response.send_message(help_text, ephemeral=True)
-
-# Slash command: /sync
-@tree.command(name="sync", description="Sync all slash commands globally")
-async def sync_commands(interaction: discord.Interaction):
-    # Check if user has administrator permissions
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        synced = await tree.sync()
-        await interaction.followup.send(f"Successfully synced {len(synced)} commands globally.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Failed to sync commands: {e}", ephemeral=True)
 
 # Slash Command: Ping
 @bot.tree.command(name='ping', description='Responds with the bot\'s latency')
@@ -366,285 +500,526 @@ async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     await interaction.followup.send(f'Pong! Latency: {latency}ms')
 
-# Slash Command: AI Chat
-@bot.tree.command(name='ai', description='Chat with AI (supports text and optional image)')
-async def ai(interaction: discord.Interaction, prompt: str, image_url: str = None):
-    # Defer the response to prevent timeout errors
-    await interaction.response.defer()
 
-    try:
-        client = get_ai_client()
-        content = []
-        if image_url:
-            content.append({"type": "text", "text": prompt})
-            content.append({"type": "image_url", "image_url": {"url": image_url}})
-        else:
-            content = prompt
 
-        completion = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": content}],
-            max_tokens=500,
-            temperature=0.7
-        )
 
-        ai_response = completion.choices[0].message.content.strip()
-        await interaction.followup.send(ai_response)
 
-    except Exception as e:
-        embed = discord.Embed(
-            title="AI Error",
-            description=f"Failed to get AI response: {str(e)}",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
 
-# Slash Command: Generate Image
-@bot.tree.command(name='image', description='Generate an image using AI (free)')
-@discord.app_commands.describe(
-    prompt='The prompt for image generation',
-    aspect_ratio='Aspect ratio for the image (default: 1:1)'
-)
-@discord.app_commands.choices(
-    aspect_ratio=[
-        discord.app_commands.Choice(name='1:1 (Square)', value='1:1'),
-        discord.app_commands.Choice(name='16:9 (Landscape)', value='16:9'),
-        discord.app_commands.Choice(name='9:16 (Portrait)', value='9:16'),
-        discord.app_commands.Choice(name='21:9 (Ultra-wide)', value='21:9'),
-        discord.app_commands.Choice(name='9:21 (Ultra-tall)', value='9:21')
-    ]
-)
-async def image(interaction: discord.Interaction, prompt: str, aspect_ratio: str = "1:1"):
-    # Defer the response to prevent timeout errors
-    await interaction.response.defer()
 
-    # Validate prompt length
-    if len(prompt) > 1000:
-        embed = discord.Embed(
-            title="Invalid Prompt",
-            description="Prompt must be 1000 characters or less.",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
+# Slash Command: Recover Deleted Message
+@bot.tree.command(name="recover", description="Recover the last deleted message in this channel")
+async def recover(interaction: discord.Interaction):
+    # Check permissions: owner or admins/mods
+    owner_id = os.getenv('OWNER_ID')
+    if not (interaction.user.guild_permissions.administrator or (owner_id and interaction.user.id == int(owner_id))):
+        await interaction.response.send_message("You need administrator permissions or be the bot owner to use this command.", ephemeral=True)
         return
 
-    try:
-        # Map aspect ratios to Pollinations.ai dimensions
-        aspect_map = {
-            "1:1": (1024, 1024),
-            "16:9": (1024, 576),
-            "9:16": (576, 1024),
-            "21:9": (1024, 438),
-            "9:21": (438, 1024)
-        }
-        width, height = aspect_map.get(aspect_ratio, (1024, 1024))
+    channel_id = interaction.channel_id
+    data = bot.deleted_messages.get(channel_id)
 
-        # Use Pollinations.ai (free, no API key needed)
-        image_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width={width}&height={height}&model=flux"
+    if not data:
+        await interaction.response.send_message("I haven't seen any messages deleted here since I woke up!", ephemeral=True)
+        return
+
+    # Create a nice look for the recovered info
+    embed = discord.Embed(
+        title="🗑️ Recovered Message",
+        description=data["content"],
+        color=discord.Color.blue(),
+        timestamp=data["time"]
+    )
+    embed.set_author(name=f"{data['author']} ({data['author'].id})", icon_url=data['author'].display_avatar.url)
+    embed.set_footer(text="Sent at")
+
+    await interaction.response.send_message(embed=embed)
+
+# Slash Command: Talk
+@bot.tree.command(name='talk', description='Text-to-speech using ElevenLabs')
+async def talk(interaction: discord.Interaction, message: str):
+    await interaction.response.defer()
+    
+    try:
+        url = "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": "sk_c2c8bdbf7e18561f4fd83e4d16b3bf3ab13a621c7e9b2ed3"
+        }
+        data = {
+            "text": message,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.5
+            }
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data, headers=headers) as response:
+                if response.status == 200:
+                    audio_data = await response.read()
+                    audio_file = discord.File(io.BytesIO(audio_data), filename="tts.mp3")
+                    await interaction.followup.send(file=audio_file)
+                else:
+                    error_text = await response.text()
+                    await interaction.followup.send(f"TTS failed: {response.status} - {error_text[:50]}...")
+        
+    except Exception as e:
+        await interaction.followup.send(f"TTS failed: {str(e)[:50]}...")
+
+# YouTube search function
+def search_youtube(query, max_retries=2):
+    """Search YouTube and return video data with thumbnails and links."""
+    if not youtube:
+        return "YouTube API not available"
+
+    import time
+
+    for attempt in range(max_retries + 1):
+        try:
+            request = youtube.search().list(
+                q=query,
+                part="snippet",
+                maxResults=5,
+                type="video"
+            )
+            response = request.execute()
+
+            if not response['items']:
+                return None
+
+            results = []
+            for item in response['items']:
+                video_id = item['id']['videoId']
+                title = item['snippet']['title']
+                channel = item['snippet']['channelTitle']
+                thumbnail = item['snippet']['thumbnails']['high']['url']
+                url = f"https://youtube.com/watch?v={video_id}"
+
+                results.append({
+                    'title': title,
+                    'channel': channel,
+                    'url': url,
+                    'thumbnail': thumbnail,
+                    'video_id': video_id
+                })
+
+            return results
+
+        except Exception as e:
+            error_str = str(e)
+            if "[WinError 10054]" in error_str or "ConnectionError" in error_str or "connection" in error_str.lower():
+                if attempt < max_retries:
+                    time.sleep(2)  # Wait 2 seconds before retry
+                    continue
+                return "YouTube search failed: Network connection error - please try again later"
+            elif "quota" in error_str.lower() or "403" in error_str:
+                return "YouTube search failed: API quota exceeded"
+            elif "400" in error_str:
+                return "YouTube search failed: Invalid API request"
+            else:
+                return f"YouTube search failed: {error_str}"
+
+class JumpModal(discord.ui.Modal, title="Jump to Page"):
+    page_num = discord.ui.TextInput(label="Page Number", placeholder="Enter a number...")
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            page = int(self.page_num.value) - 1
+            if 0 <= page < len(self.view.results):
+                self.view.current_page = page
+                await self.view.update_message(interaction)
+            else:
+                await interaction.response.send_message(f"Invalid page! Please enter 1-{len(self.view.results)}", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("Please enter a valid number!", ephemeral=True)
+
+class YouTubeView(discord.ui.View):
+    def __init__(self, results):
+        super().__init__(timeout=300)
+        self.results = results
+        self.current_page = 0
+
+    async def update_message(self, interaction):
+        result = self.results[self.current_page]
+        embed = discord.Embed(
+            title=result['title'],
+            description=f"Uploaded by **{result['channel']}**\n{result['url']}",
+            color=0xff0000
+        )
+        embed.set_author(name=f"Page {self.current_page + 1} of {len(self.results)}")
+        embed.set_image(url=result['thumbnail'])
+        
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="◀️")
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            await self.update_message(interaction)
+        else:
+            await interaction.response.send_message("Already on first page!", ephemeral=True)
+
+    @discord.ui.button(label="Forward", style=discord.ButtonStyle.secondary, emoji="▶️")
+    async def forward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < len(self.results) - 1:
+            self.current_page += 1
+            await self.update_message(interaction)
+        else:
+            await interaction.response.send_message("Already on last page!", ephemeral=True)
+
+    @discord.ui.button(label="Jump", style=discord.ButtonStyle.secondary, emoji="🔢")
+    async def jump(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(JumpModal(self))
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await interaction.delete_original_response()
+
+# Smart AI response with reasoning
+def get_smart_response(user_query):
+    system_prompt = """
+You are an advanced reasoning engine. Before providing a final answer, 
+you must follow these three steps:
+1. BREAKDOWN: Identify the core components of the user's request.
+2. REASONING: Solve the problem step-by-step in a hidden scratchpad.
+3. CRITIQUE: Look for errors in your reasoning.
+
+Format your response as follows:
+<thinking> [Your step-by-step logic here] </thinking>
+<final_answer> [Your actual response to the user] </final_answer>
+"""
+
+    response = ai_client.chat.completions.create(
+        model="llama3.1-8b",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0
+    )
+    
+    return response.choices[0].message.content
+
+# Helper function for AI requests with timeout and retry
+async def make_ai_request(messages, max_tokens=200, temperature=0.7, max_retries=2):
+    for attempt in range(max_retries + 1):
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: ai_client.chat.completions.create(
+                        model="llama3.1-8b",
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature
+                    )
+                ),
+                timeout=30.0
+            )
+            return response
+        except asyncio.TimeoutError:
+            if attempt < max_retries:
+                print(f"AI request timed out, retrying ({attempt + 1}/{max_retries + 1})")
+                await asyncio.sleep(1)  # Wait 1 second before retry
+            else:
+                raise Exception("AI request timed out after retries")
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"AI request failed: {e}, retrying ({attempt + 1}/{max_retries + 1})")
+                await asyncio.sleep(1)
+            else:
+                raise e
+
+# AI request using Cerebras (OpenAI-compatible) with smart reasoning
+async def cerebras_ai_request(prompt, user_id=None):
+    try:
+        print(f"Making Cerebras AI request with prompt: {prompt[:50]}...")
+        
+        # Check for YouTube search requests
+        youtube_keywords = ['youtube', 'video', 'watch', 'reviews', 'tutorial', 'how to']
+        if any(keyword in prompt.lower() for keyword in youtube_keywords):
+            # Generate search query
+            search_response = await make_ai_request(
+                messages=[{"role": "user", "content": f"Create a YouTube search query for: {prompt}"}],
+                temperature=0
+            )
+            query = search_response.choices[0].message.content.strip('"')
+            
+            # Get YouTube results
+            youtube_data = await asyncio.to_thread(search_youtube, query)
+            
+            # Generate final response with YouTube data
+            final_response = await make_ai_request(
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant. Use the YouTube data to answer the user."},
+                    {"role": "assistant", "content": f"Here's what I found on YouTube:\n{youtube_data}"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7
+            )
+            ai_response = final_response.choices[0].message.content
+        
+        # Use smart reasoning for complex queries
+        elif any(word in prompt.lower() for word in ['calculate', 'solve', 'how many', 'what if', 'analyze', 'compare', 'reason']):
+            try:
+                ai_response = await asyncio.wait_for(
+                    asyncio.to_thread(get_smart_response, prompt),
+                    timeout=60.0  # Longer timeout for reasoning
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Smart reasoning timed out")
+            
+            # Extract final answer from thinking tags
+            if '<final_answer>' in ai_response and '</final_answer>' in ai_response:
+                start = ai_response.find('<final_answer>') + len('<final_answer>')
+                end = ai_response.find('</final_answer>')
+                ai_response = ai_response[start:end].strip()
+        else:
+            # Build messages with memory if user_id provided
+            if user_id and user_id in user_memory:
+                messages = [{"role": msg["role"], "content": msg["content"]} for msg in user_memory[user_id]] + [{"role": "user", "content": prompt}]
+            else:
+                messages = [{"role": "user", "content": prompt}]
+
+            response = await make_ai_request(messages=messages, max_tokens=200, temperature=0.7)
+            ai_response = response.choices[0].message.content
+        
+        # Store in memory if user_id provided
+        if user_id:
+            if user_id not in user_memory:
+                user_memory[user_id] = []
+            user_memory[user_id].append({"role": "user", "content": prompt, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+            user_memory[user_id].append({"role": "assistant", "content": ai_response, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+            # Keep only last 20 messages (10 exchanges)
+            if len(user_memory[user_id]) > 20:
+                user_memory[user_id] = user_memory[user_id][-20:]
+        
+        print(f"Cerebras AI response: {ai_response[:50]}...")
+        return ai_response
+    except Exception as e:
+        print(f"Cerebras AI Error: {e}")
+        return None
+
+# Slash Command: AI Chat with cooldown
+@bot.tree.command(name='ai', description='Chat with AI (supports text and optional image)')
+@app_commands.describe(prompt="Your question or message to the AI")
+async def ai(interaction: discord.Interaction, prompt: str, attachment: discord.Attachment = None):
+    user_id = interaction.user.id
+    
+    # Create a lock for the user if it doesn't exist
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    
+    # Try to acquire the lock
+    if user_locks[user_id].locked():
+        await interaction.response.send_message(f"⚠️ {interaction.user.mention}, I'm still processing your previous prompt! Please wait.", ephemeral=True)
+        return
+    
+    # Check cooldown manually for slash commands (10 seconds)
+    current_time = time.time()
+    if user_id in ai_cooldowns and current_time - ai_cooldowns[user_id] < 10:
+        retry_after = 10 - (current_time - ai_cooldowns[user_id])
+        await interaction.response.send_message(f"Slow down! Try again in {retry_after:.2f}s.", ephemeral=True)
+        return
+    
+    ai_cooldowns[user_id] = current_time
+    await interaction.response.defer()
+    
+    async with user_locks[user_id]:
+        try:
+            # Check for image attachment
+            image_data = None
+            if attachment and any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp']):
+                image_data = await get_image_bytes(attachment.url)
+            
+            # Handle image + text or just text
+            if image_data and gemini_model:
+                try:
+                    contents = [
+                        prompt,
+                        {"mime_type": attachment.content_type, "data": image_data}
+                    ]
+                    response = await asyncio.to_thread(gemini_model.generate_content, contents)
+                    ai_response = response.text
+                except Exception as e:
+                    print(f"Gemini Error: {e}")
+                    ai_response = "I can see you sent an image, but I'm having trouble analyzing it right now! 📸😅"
+            else:
+                # Text-only response using Cerebras
+                ai_response = await cerebras_ai_request(prompt, user_id)
+            
+            if ai_response:
+                # Truncate if too long for Discord (2000 char limit)
+                if len(ai_response) > 1900:
+                    ai_response = ai_response[:1900] + "..."
+                
+                await interaction.followup.send(ai_response)
+            else:
+                await interaction.followup.send("AI service is currently unavailable. Please try again later.")
+
+        except Exception as e:
+            await interaction.followup.send(f"AI Error: {str(e)[:100]}...")
+
+
+
+# Slash Command: Generate Image
+@bot.tree.command(name='image', description='Generate an image using AI')
+async def image(interaction: discord.Interaction, prompt: str):
+    await interaction.response.defer()
+    
+    try:
+        image_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.read()
+                    image_file = discord.File(io.BytesIO(data), filename="image.png")
+                    await interaction.followup.send(file=image_file)
+                else:
+                    await interaction.followup.send("Image generation failed")
+                
+    except Exception as e:
+        await interaction.followup.send(f"Image generation failed: {str(e)[:50]}...")
+
+
+
+# Slash Command: Describe
+@bot.tree.command(name='describe', description='Generate a description using AI')
+@app_commands.describe(attachment="Attach an image to describe")
+async def describe(interaction: discord.Interaction, attachment: discord.Attachment):
+    """Command to describe an attached image"""
+
+    # Verify it's an image file
+    if any(attachment.filename.lower().endswith(ext) for ext in ['png', 'jpg', 'jpeg', 'webp']):
+        await interaction.response.defer()
+        if not gemini_model:
+            await interaction.followup.send("Image recognition is not available - Gemini API key not configured.")
+            return
 
         # Download the image
-        response = requests.get(image_url, timeout=30)
+        image_data = await get_image_bytes(attachment.url)
 
-        if response.status_code == 200:
-            # The response content is the image binary
-            image_data = response.content
+        if image_data:
+            try:
+                # Wrap the data for Gemini
+                contents = [
+                    "Describe this image in detail.",
+                    {"mime_type": attachment.content_type, "data": image_data}
+                ]
 
-            # Create a file-like object for Discord
-            from io import BytesIO
-            image_file = discord.File(BytesIO(image_data), filename="generated_image.jpeg")
-
-            await interaction.followup.send(file=image_file)
+                # Generate the vision response
+                response = await asyncio.to_thread(gemini_model.generate_content, contents)
+                await interaction.followup.send(response.text)
+            except Exception as e:
+                error_msg = str(e)
+                if "API key not valid" in error_msg or "400" in error_msg:
+                    await interaction.followup.send("⚠️ **Configuration Error:** The Gemini API key is invalid. Please check your `.env` file.")
+                else:
+                    await interaction.followup.send(f"Failed to analyze image: {error_msg[:100]}...")
         else:
-            embed = discord.Embed(
-                title="Image Generation Error",
-                description=f"Failed to generate image: HTTP {response.status_code}",
-                color=discord.Color.red()
-            )
-            await interaction.followup.send(embed=embed)
-
-    except requests.exceptions.Timeout:
-        embed = discord.Embed(
-            title="Timeout Error",
-            description="Image generation took too long. Please try again.",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
-    except requests.exceptions.RequestException as e:
-        embed = discord.Embed(
-            title="Network Error",
-            description=f"Failed to connect to Pollinations.ai: {str(e)}",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        embed = discord.Embed(
-            title="Unexpected Error",
-            description=f"An unexpected error occurred: {str(e)}",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
+            await interaction.followup.send("Failed to download the image.")
+    else:
+        await interaction.response.send_message("That doesn't look like a supported image format.", ephemeral=True)
 
 # Slash Command: Ship
-@bot.tree.command(name='ship', description='Ship two users and rate their love compatibility')
+@bot.tree.command(name='ship', description='Check the compatibility of two users')
 async def ship(interaction: discord.Interaction, user1: discord.Member, user2: discord.Member):
-    # Generate random love percentage with 1% chance of over 100%
-    if random.random() < 0.01:  # 1% chance
-        love_percentage = random.randint(101, 150)  # Over 100% for "over ship"
+    score = random.randint(0, 100)
+    
+    # Create a visual progress bar
+    filled = int(score / 10)
+    bar = "❤️" * filled + "💔" * (10 - filled)
+    
+    # Determine the status message
+    if score >= 80:
+        status = "It's a Match! 💍"
+        color = discord.Color.red()
+    elif score >= 50:
+        status = "There's a spark! ✨"
+        color = discord.Color.orange()
     else:
-        love_percentage = random.randint(0, 100)
+        status = "Just friends... for now. ☕"
+        color = discord.Color.blue()
 
-    # Determine compatibility message based on percentage
-    if love_percentage > 100:
-        compatibility_msg = "💫 OVER SHIP! Destiny has spoken! 💫"
-    elif love_percentage >= 90:
-        compatibility_msg = "💕 Perfect Match! Soulmates! 💕"
-    elif love_percentage >= 70:
-        compatibility_msg = "💖 Great Match! Love is in the air! 💖"
-    elif love_percentage >= 50:
-        compatibility_msg = "💗 Good Match! There's potential! 💗"
-    elif love_percentage >= 30:
-        compatibility_msg = "💓 It's Complicated... 💓"
-    else:
-        compatibility_msg = "💔 Not Meant to Be... 💔"
-
-    # List of romantic images for variety
-    romantic_images = [
-        "https://i.imgur.com/8cNF0zQ.png",  # Hearts background
-        "https://i.imgur.com/4Q3wX8L.png",  # Romantic couple
-        "https://i.imgur.com/J8w7Z9K.png",  # Love birds
-        "https://i.imgur.com/M5v8N2P.png",  # Sunset couple
-        "https://i.imgur.com/R3tY7sL.png",  # Heart balloons
-        "https://i.imgur.com/X9pW4mQ.png"   # Romantic dinner
-    ]
-
-    # Select random image
-    selected_image = random.choice(romantic_images)
-
-    # Create embed with random romantic image
     embed = discord.Embed(
-        title=f"💘 Ship: {user1.name} x {user2.name} 💘",
-        description=f"{user1.mention} ❤️ {user2.mention}\n\n**Love Compatibility: {love_percentage}%**\n{compatibility_msg}",
-        color=discord.Color.from_rgb(255, 105, 180)  # Hot pink color
+        title="💘 Love Calculator",
+        color=color
     )
-
-    # Apply the random romantic image to the embed
-    embed.set_image(url=selected_image)
-    embed.set_footer(text=f"💕 Shipped by {interaction.user.name} 💕", icon_url=interaction.user.display_avatar.url)
-
-    # Respond immediately with the embed
+    
+    embed.add_field(name="💑 Couple", value=f"{user1.mention} ❤️ {user2.mention}", inline=False)
+    embed.add_field(name="📊 Compatibility Score", value=f"**{score}%**\n{bar}", inline=False)
+    embed.add_field(name="🔮 Result", value=status, inline=False)
+    embed.set_thumbnail(url="https://cdn.discordapp.com/emojis/1234567890123456789.png")  # Love/heart emoji
+    embed.set_footer(text=f"Shipped by {interaction.user.display_name}", icon_url=interaction.user.display_avatar.url)
+    embed.timestamp = datetime.datetime.now(datetime.timezone.utc)
+    
     await interaction.response.send_message(embed=embed)
 
 # Slash Command: Pet
-@bot.tree.command(name='pet', description='Show random images of cute pets')
-async def pet(interaction: discord.Interaction, pet_type: str = None):
-    # List of pet images with variety for each type
-    pet_images = {
-        'dog': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/8Q3ZJfK.png',
-            'https://i.imgur.com/4M5N7Pq.png',
-            'https://i.imgur.com/9R2T6Sx.png'
-        ],
-        'cat': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/2K8M4Lq.png',
-            'https://i.imgur.com/7N9P3Rt.png',
-            'https://i.imgur.com/5V6B8Uy.png'
-        ],
-        'bird': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/1A3D5Fg.png',
-            'https://i.imgur.com/6H7J9Km.png',
-            'https://i.imgur.com/3E4F8Hn.png'
-        ],
-        'fish': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/2B4C6Gj.png',
-            'https://i.imgur.com/8K9L2Np.png',
-            'https://i.imgur.com/5M7O3Qr.png'
-        ],
-        'rabbit': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/4N6P8Rs.png',
-            'https://i.imgur.com/9T2U7Vx.png',
-            'https://i.imgur.com/1W3Y5Za.png'
-        ],
-        'hamster': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/6B8D2Fk.png',
-            'https://i.imgur.com/3G5H7Jl.png',
-            'https://i.imgur.com/7K9M4Nq.png'
-        ],
-        'turtle': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/2P4R6St.png',
-            'https://i.imgur.com/8U1V3Wx.png',
-            'https://i.imgur.com/5Y7Z9Ac.png'
-        ],
-        'snake': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/4E6G8Hj.png',
-            'https://i.imgur.com/9I2K5Lm.png',
-            'https://i.imgur.com/1O3Q7Tn.png'
-        ],
-        'lizard': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/6S8U2Va.png',
-            'https://i.imgur.com/3D5F7Gb.png',
-            'https://i.imgur.com/7H9J4Kc.png'
-        ],
-        'frog': [
-            'https://i.imgur.com/CrWcxNh.png',
-            'https://i.imgur.com/2X4Z6Cb.png',
-            'https://i.imgur.com/8V1B3Nd.png',
-            'https://i.imgur.com/5M7P9Fe.png'
-        ]
+@bot.tree.command(name='pet', description='Pet a specific animal!')
+@app_commands.choices(animal=[
+    app_commands.Choice(name="Dog", value="dog"),
+    app_commands.Choice(name="Cat", value="cat"),
+    app_commands.Choice(name="Bunny", value="bunny"),
+    app_commands.Choice(name="Panda", value="panda")
+])
+async def pet(interaction: discord.Interaction, animal: app_commands.Choice[str]):
+    # Data dictionary for each pet type
+    pet_data = {
+        "dog": {
+            "title": "Good Boy! 🐶",
+            "msg": "You gave the dog a belly rub!",
+            "url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExOHYycW8xdm90c2Z3Z3R4eHh4eHh4eHh4eHh4eHh4eHh4eHh4JmVwPXYxX2ludGVybmFsX2dpZl9ieV9pZCZjdD1n/4T7eWG7jRmsTVEDKXO/giphy.gif",
+            "color": discord.Color.gold()
+        },
+        "cat": {
+            "title": "Purrfection 🐱",
+            "msg": "The cat purrs and leans into your hand.",
+            "url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExOHYycW8xdm90c2Z3Z3R4eHh4eHh4eHh4eHh4eHh4eHh4eHh4JmVwPXYxX2ludGVybmFsX2dpZl9ieV9pZCZjdD1n/3o72F7YT6s0EMFI0zk/giphy.gif",
+            "color": discord.Color.purple()
+        },
+        "bunny": {
+            "title": "Soft Hops 🐰",
+            "msg": "You gently pat the bunny's soft ears.",
+            "url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExOHYycW8xdm90c2Z3Z3R4eHh4eHh4eHh4eHh4eHh4eHh4eHh4JmVwPXYxX2ludGVybmFsX2dpZl9ieV9pZCZjdD1n/108GZES8iG0qcE/giphy.gif",
+            "color": discord.Color.from_rgb(255, 192, 203)  # Pink
+        },
+        "panda": {
+            "title": "Bamboo Friend 🐼",
+            "msg": "The panda stops eating bamboo for a quick head pat.",
+            "url": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExOHYycW8xdm90c2Z3Z3R4eHh4eHh4eHh4eHh4eHh4eHh4eHh4JmVwPXYxX2ludGVybmFsX2dpZl9ieV9pZCZjdD1n/EatwJZRUIv41G/giphy.gif",
+            "color": discord.Color.light_grey()
+        }
     }
 
-    # If no pet type specified, randomly choose from all types for variety
-    if pet_type is None:
-        available_types = list(pet_images.keys())
-        selected_pet_type = random.choice(available_types)
-        images = pet_images[selected_pet_type]
-        pet_display_name = selected_pet_type.title()
-    else:
-        # Get images for the requested pet type (case insensitive)
-        pet_lower = pet_type.lower()
-        images = pet_images.get(pet_lower, pet_images['dog'])  # Default to dog if invalid type
-        pet_display_name = pet_type.title()
+    # Get the data for the selected animal
+    selected = pet_data[animal.value]
 
-    # Select a random image
-    selected_image = random.choice(images)
-
-    # Create embed with the pet image
+    # Build the Embed
     embed = discord.Embed(
-        title=f"🐾 Cute {pet_display_name}! 🐾",
-        description=f"Here's a random image of a {pet_display_name.lower()}!",
-        color=discord.Color.blue()
+        title=selected["title"],
+        description=f"{interaction.user.mention}, {selected['msg']}",
+        color=selected["color"]
     )
-    embed.set_image(url=selected_image)
-    embed.set_footer(text=f"Requested by {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
+    embed.set_image(url=selected["url"])
+    embed.set_footer(text=f"Petting a {animal.name}!")
 
-    # Respond with the embed
     await interaction.response.send_message(embed=embed)
-
-# Slash Command: AFK
-@bot.tree.command(name='afk', description='Set yourself as AFK with an optional reason')
-async def afk(interaction: discord.Interaction, reason: str = "AFK"):
-    # Defer the response to prevent timeout errors
-    await interaction.response.defer()
-    afk_users[interaction.user.id] = reason
-    embed = discord.Embed(
-        title="AFK Set",
-        description=f"You are now AFK: {reason}",
-        color=discord.Color.blue()
-    )
-    await interaction.followup.send(embed=embed)
 
 # Slash Command: Enable Quiet Mode
 @bot.tree.command(name='quiet', description='Enable quiet mode (owner only)')
-@commands.is_owner()
 async def slash_quiet(interaction: discord.Interaction):
+    owner_id = os.getenv('OWNER_ID')
+    if not owner_id or interaction.user.id != int(owner_id):
+        await interaction.response.send_message("Only the bot owner can use this command.", ephemeral=True)
+        return
+        
     global quiet_mode
     quiet_mode = True
     embed = discord.Embed(
@@ -657,8 +1032,12 @@ async def slash_quiet(interaction: discord.Interaction):
 
 # Slash Command: Disable Quiet Mode
 @bot.tree.command(name='unquiet', description='Disable quiet mode (owner only)')
-@commands.is_owner()
 async def slash_unquiet(interaction: discord.Interaction):
+    owner_id = os.getenv('OWNER_ID')
+    if not owner_id or interaction.user.id != int(owner_id):
+        await interaction.response.send_message("Only the bot owner can use this command.", ephemeral=True)
+        return
+        
     global quiet_mode
     quiet_mode = False
     embed = discord.Embed(
@@ -671,16 +1050,45 @@ async def slash_unquiet(interaction: discord.Interaction):
 
 # Slash Command: Set Announcement Channel
 @bot.tree.command(name='setannounce', description='Set the announcement channel for bot online messages (manage guild permission required)')
-@commands.has_permissions(manage_guild=True)
+@app_commands.guild_only()
 async def setannounce(interaction: discord.Interaction, channel: discord.TextChannel):
-    # Defer the response to prevent timeout errors
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need 'Manage Server' permission to use this command.", ephemeral=True)
+        return
+
     await interaction.response.defer()
 
     announce_channels[interaction.guild.id] = channel.id
+    
+    # Save to file
+    try:
+        with open(ANNOUNCE_FILE, 'w') as f:
+            json.dump(announce_channels, f)
+    except Exception as e:
+        print(f"Error saving announce channels: {e}")
+
     embed = discord.Embed(
         title="Announcement Channel Set",
         description=f"Online announcements will be sent to {channel.mention}",
         color=discord.Color.green()
+    )
+    embed.set_footer(text=f"Set by {interaction.user}")
+    await interaction.followup.send(embed=embed)
+
+# Slash Command: Invite Track (Set Welcome Channel)
+@bot.tree.command(name='invite-track', description='Set the welcome channel where join messages are sent (manage guild permission required)')
+async def invite_track(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You need 'Manage Server' permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    welcome_channels[interaction.guild.id] = channel.id
+    embed = discord.Embed(
+        title="Welcome Channel Set",
+        description=f"Welcome messages will be sent to {channel.mention}",
+        color=discord.Color.blue()
     )
     embed.set_footer(text=f"Set by {interaction.user}")
     await interaction.followup.send(embed=embed)
@@ -711,8 +1119,11 @@ async def invites(interaction: discord.Interaction):
     for code, info in invites.items():
         inviter_id = info['inviter']
         uses = info['uses']
-        inviter = interaction.guild.get_member(inviter_id)
-        inviter_name = inviter.mention if inviter else f"User {inviter_id}"
+        if inviter_id:
+            inviter = interaction.guild.get_member(inviter_id)
+            inviter_name = inviter.mention if inviter else f"User {inviter_id}"
+        else:
+            inviter_name = "Unknown"
         invite_list += f"**{code}** - {inviter_name} ({uses} uses)\n"
 
     if invite_list:
@@ -727,9 +1138,12 @@ async def invites(interaction: discord.Interaction):
         inviter_id = join['inviter_id']
         timestamp = join['timestamp']
         user = interaction.guild.get_member(user_id)
-        inviter = interaction.guild.get_member(inviter_id)
         user_name = user.mention if user else f"User {user_id}"
-        inviter_name = inviter.mention if inviter else f"User {inviter_id}"
+        if inviter_id:
+            inviter = interaction.guild.get_member(inviter_id)
+            inviter_name = inviter.mention if inviter else f"User {inviter_id}"
+        else:
+            inviter_name = "Unknown"
         join_list += f"{user_name} invited by {inviter_name} at {timestamp}\n"
 
     if join_list:
@@ -740,9 +1154,60 @@ async def invites(interaction: discord.Interaction):
     embed.set_footer(text=f"Requested by {interaction.user}")
     await interaction.followup.send(embed=embed)
 
+# Slash Command: Joke
+@bot.tree.command(name='joke', description='Tell a random joke')
+async def joke(interaction: discord.Interaction):
+    urls = [
+        "https://v2.jokeapi.dev/joke/Any?safe-mode&type=single",
+        "https://official-joke-api.appspot.com/random_joke"
+    ]
+    
+    try:
+        selected_url = random.choice(urls)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(selected_url) as resp:
+                response = await resp.json()
+                if "joke" in response:
+                    joke_text = response["joke"]
+                else:
+                    joke_text = f"{response['setup']}\n\n*... {response['punchline']}*"
+        
+        await interaction.response.send_message(f"😂 {joke_text}")
+    except:
+        fallback_jokes = [
+            "Why don't scientists trust atoms? Because they make up everything!",
+            "Why did the scarecrow win an award? He was outstanding in his field!",
+            "What do you call a fake noodle? An impasta!"
+        ]
+        await interaction.response.send_message(f"😂 {random.choice(fallback_jokes)}")
+
+
+
+# Slash Command: Purge
+@bot.tree.command(name='purge', description='Clears specified number of messages')
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.describe(amount="Number of messages to delete")
+async def purge(interaction: discord.Interaction, amount: int):
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=amount + 1)
+    await interaction.followup.send(f'{len(deleted) - 1} messages have been cleared!', ephemeral=True)
+
+# Slash Command: Server Info
+@bot.tree.command(name='serverinfo', description='Displays information about the server')
+async def server_info(interaction: discord.Interaction):
+    guild = interaction.guild
+    embed = discord.Embed(title=f'{guild.name} Server Information', color=discord.Color.blue())
+    embed.add_field(name='Server Owner', value=guild.owner.mention, inline=False)
+    embed.add_field(name='Member Count', value=guild.member_count, inline=True)
+    embed.add_field(name='Channel Count', value=len(guild.channels), inline=True)
+    embed.add_field(name='Server Created', value=guild.created_at.strftime('%B %d, %Y'), inline=False)
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+    await interaction.response.send_message(embed=embed)
+
+
 # Slash Command: Info (user profile + badges)
 @bot.tree.command(name='info', description='Shows profile information and badges for a user')
-async def info_slash(interaction: discord.Interaction, member: discord.Member = None):
+async def info(interaction: discord.Interaction, member: discord.Member = None):
     # Respond immediately with the embed (no defer needed for this command)
     user = member or interaction.user
 
@@ -768,31 +1233,57 @@ async def info_slash(interaction: discord.Interaction, member: discord.Member = 
         else:
             embed.add_field(name='Current Activity', value='None', inline=False)
 
-    # Badges / Public flags
+        # Joined date
+        joined = getattr(user, 'joined_at', None)
+        if joined:
+            embed.add_field(name='Joined Server', value=joined.strftime('%Y-%m-%d %H:%M'), inline=False)
+
+    # Badges / Public flags - Display ALL badges
     flags = getattr(user, 'public_flags', None)
-    # Mapping for badge names with emojis
+    # Comprehensive mapping for ALL badge names with emojis
     badge_map = {
         'staff': '👨‍💼 Discord Staff',
-        'partner': '🤝 Partner',
-        'hypesquad': '🏠 HypeSquad',
+        'partner': '🤝 Partnered Server Owner',
+        'hypesquad': '🏠 HypeSquad Events',
         'bug_hunter': '🐛 Bug Hunter',
-        'bug_hunter_level_2': '🐞 Bug Hunter (Level 2)',
+        'bug_hunter_level_2': '🐞 Bug Hunter Level 2',
         'hypesquad_bravery': '💪 HypeSquad Bravery',
         'hypesquad_brilliance': '💡 HypeSquad Brilliance',
         'hypesquad_balance': '⚖️ HypeSquad Balance',
         'early_supporter': '👑 Early Supporter',
+        'early_verified_bot_developer': '🤖 Early Verified Bot Developer',
         'team_user': '👥 Team User',
         'verified_bot_developer': '🤖 Verified Bot Developer',
         'system': '⚙️ System',
         'premium_subscriber': '✨ Nitro Subscriber',
         'active_developer': '💻 Active Developer',
         'discord_employee': '🏢 Discord Employee',
-        'certified_moderator': '🛡️ Certified Moderator'
+        'certified_moderator': '🛡️ Certified Moderator',
+        'bot_http_interactions': '🤖 Bot HTTP Interactions',
+        'spammer': '🚫 Spammer',
+        # Quest badges
+        'quest_apprentice': '🔮 Quest Apprentice',
+        'quest_journeyman': '🧙 Quest Journeyman',
+        'quest_master': '🧙‍♂️ Quest Master',
+        'quest_hero': '🏆 Quest Hero',
+        'quest_legend': '👑 Quest Legend',
+        # Other special badges
+        'legacy_username': '📜 Legacy Username',
+        'username_changeable': '🔄 Username Changeable',
+        'guild_booster_lvl_1': '🚀 Server Booster Level 1',
+        'guild_booster_lvl_2': '🚀 Server Booster Level 2',
+        'guild_booster_lvl_3': '🚀 Server Booster Level 3',
+        'guild_booster_lvl_4': '🚀 Server Booster Level 4',
+        'guild_booster_lvl_5': '🚀 Server Booster Level 5',
+        'guild_booster_lvl_6': '🚀 Server Booster Level 6',
+        'guild_booster_lvl_7': '🚀 Server Booster Level 7',
+        'guild_booster_lvl_8': '🚀 Server Booster Level 8',
+        'guild_booster_lvl_9': '🚀 Server Booster Level 9'
     }
 
     badges = []
     if flags is not None:
-        # Inspect all attributes on the flags object and collect truthy boolean flags
+        # Inspect all attributes on the flags object and collect ALL truthy boolean flags
         for attr in dir(flags):
             if attr.startswith('_'):
                 continue
@@ -801,398 +1292,129 @@ async def info_slash(interaction: discord.Interaction, member: discord.Member = 
             except Exception:
                 continue
             if isinstance(val, bool) and val:
+                # Use mapped name if available, otherwise format the attribute name
                 label = badge_map.get(attr, attr.replace('_', ' ').title())
                 badges.append(label)
-        # Deduplicate while preserving order
-        seen = set()
-        unique_badges = []
-        for b in badges:
-            if b not in seen:
-                unique_badges.append(b)
-                seen.add(b)
-        badges = unique_badges
+
+        # Also check for any integer flags that might represent special badges
+        try:
+            if hasattr(flags, 'value') and flags.value:
+                # Check for special flag combinations
+                if flags.value & 1:  # Discord Employee
+                    if '🏢 Discord Employee' not in badges:
+                        badges.append('🏢 Discord Employee')
+                if flags.value & 2:  # Discord Partner
+                    if '🤝 Partnered Server Owner' not in badges:
+                        badges.append('🤝 Partnered Server Owner')
+                if flags.value & 4:  # HypeSquad Events
+                    if '🏠 HypeSquad Events' not in badges:
+                        badges.append('🏠 HypeSquad Events')
+                if flags.value & 8:  # Bug Hunter Level 1
+                    if '🐛 Bug Hunter' not in badges:
+                        badges.append('🐛 Bug Hunter')
+                if flags.value & 64:  # House Bravery
+                    if '💪 HypeSquad Bravery' not in badges:
+                        badges.append('💪 HypeSquad Bravery')
+                if flags.value & 128:  # House Brilliance
+                    if '💡 HypeSquad Brilliance' not in badges:
+                        badges.append('💡 HypeSquad Brilliance')
+                if flags.value & 256:  # House Balance
+                    if '⚖️ HypeSquad Balance' not in badges:
+                        badges.append('⚖️ HypeSquad Balance')
+                if flags.value & 512:  # Early Supporter
+                    if '👑 Early Supporter' not in badges:
+                        badges.append('👑 Early Supporter')
+                if flags.value & 1024:  # Team User
+                    if '👥 Team User' not in badges:
+                        badges.append('👥 Team User')
+                if flags.value & 2048:  # System
+                    if '⚙️ System' not in badges:
+                        badges.append('⚙️ System')
+                if flags.value & 4096:  # Bug Hunter Level 2
+                    if '🐞 Bug Hunter Level 2' not in badges:
+                        badges.append('🐞 Bug Hunter Level 2')
+                if flags.value & 8192:  # Verified Bot
+                    if '🤖 Verified Bot Developer' not in badges:
+                        badges.append('🤖 Verified Bot Developer')
+                if flags.value & 16384:  # Early Verified Bot Developer
+                    if '🤖 Early Verified Bot Developer' not in badges:
+                        badges.append('🤖 Early Verified Bot Developer')
+                if flags.value & 262144:  # Certified Moderator
+                    if '🛡️ Certified Moderator' not in badges:
+                        badges.append('🛡️ Certified Moderator')
+                if flags.value & 4194304:  # Active Developer
+                    if '💻 Active Developer' not in badges:
+                        badges.append('💻 Active Developer')
+        except Exception:
+            pass  # Ignore any errors in flag parsing
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_badges = []
+    for b in badges:
+        if b not in seen:
+            unique_badges.append(b)
+            seen.add(b)
+    badges = unique_badges
 
     embed.add_field(name='Badges', value=', '.join(badges) if badges else 'None', inline=False)
-
-    # If Member, add joined date at the bottom
-    if isinstance(user, discord.Member):
-        joined = getattr(user, 'joined_at', None)
-        if joined:
-            embed.add_field(name='Joined Server', value=joined.strftime('%Y-%m-%d %H:%M'), inline=False)
 
     # ID and mention
     embed.set_footer(text=f'User ID: {user.id} | Requested by {interaction.user}', icon_url=interaction.user.display_avatar.url)
     await interaction.response.send_message(embed=embed)
 
-# Slash Command: Notify Tester
-@bot.tree.command(name="notify_tester", description="DMs a user about their app test request.")
-@commands.has_permissions(administrator=True)
-async def notify_tester(interaction: discord.Interaction, user_id: str):
-    """
-    Sends a custom DM notification to a specific user ID.
 
-    :param interaction: The interaction object from Discord.
-    :param user_id: The ID of the user to receive the notification.
-    """
-    await interaction.response.defer(ephemeral=True)  # Acknowledge the command quickly
 
+# Slash Command: Set Status (Owner Only)
+@bot.tree.command(name='setstatus', description='Set bot status (Owner only)')
+@app_commands.describe(status="The status text to set")
+async def setstatus(interaction: discord.Interaction, status: str):
+    owner_id = os.getenv('OWNER_ID')
+    if owner_id and interaction.user.id != int(owner_id):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+    
     try:
-        # 1. Convert the input string ID to an integer
-        target_id = int(user_id)
-
-        # 2. Fetch the User object from Discord (this is necessary to send a DM)
-        # Using bot.fetch_user is reliable for any user ID, even if they aren't in the same guild.
-        target_user = await bot.fetch_user(target_id)
-
-        if not target_user:
-            await interaction.followup.send(f"Error: Could not find user with ID `{user_id}`.", ephemeral=True)
-            return
-
-        # 3. Create the notification embed with buttons
-        embed = discord.Embed(
-            title="🧪 App Test Program Invitation",
-            description=(
-                f"Hello {target_user.name}!\n\n"
-                "We have received and are processing your application request for the **App Test Program**!\n"
-                "Our developers will be in touch shortly with an invitation to the private testing server or additional instructions.\n\n"
-                "Please let us know if you're interested in participating:"
-            ),
-            color=discord.Color.blue()
-        )
-        embed.set_footer(text="Click Accept or Decline to respond")
-
-        # Create the view with buttons
-        view = TesterResponseView(target_id)
-
-        # 4. Send the Direct Message with embed and buttons
-        await target_user.send(embed=embed, view=view)
-
-        # 5. Send confirmation back to the command user (the developer/admin)
-        await interaction.followup.send(
-            f"✅ Success! Sent test notification DM to user: **{target_user.name}** (`{target_id}`).",
-            ephemeral=True
-        )
-
-    except ValueError:
-        # Handles cases where the user input is not a valid number
-        await interaction.followup.send("Error: The user ID must be a valid number.", ephemeral=True)
-
-    except discord.Forbidden:
-        # Handles cases where the bot cannot DM the user (e.g., user blocked bot)
-        await interaction.followup.send(
-            f"Error: I could not send a DM to that user (ID: `{user_id}`). They may have DMs disabled for server members.",
-            ephemeral=True
-        )
-
+        custom_activity = discord.CustomActivity(name=status)
+        await bot.change_presence(activity=custom_activity)
+        await interaction.response.send_message(f"Status set to: {status}")
     except Exception as e:
-        # General error handling
-        logging.error(f"An unexpected error occurred: {e}")
-        await interaction.followup.send(f"An unexpected error occurred while sending the DM. Check the bot's logs. Error: `{e}`", ephemeral=True)
+        await interaction.response.send_message(f"Failed to set status: {str(e)}", ephemeral=True)
 
-# Command: Ping (prefix version)
-@bot.command(name='ping', help='Shows bot latency')
-async def ping_prefix(ctx):
-    latency = round(bot.latency * 1000)
-    await ctx.send(f'Pong! Latency: {latency}ms')
 
-# Command: Generate Image (prefix version)
-@bot.command(name='image', help='Generate an image using AI (free): j!image <prompt> [aspect_ratio]')
-async def image_prefix(ctx, prompt: str, aspect_ratio: str = "1:1"):
-    # Validate prompt length
-    if len(prompt) > 1000:
-        embed = discord.Embed(
-            title="Invalid Prompt",
-            description="Prompt must be 1000 characters or less.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
+
+# Slash Command: Sync (owner only)
+@bot.tree.command(name='sync', description='Sync slash commands (owner only)')
+async def sync(interaction: discord.Interaction):
+    owner_id = os.getenv('OWNER_ID')
+    if owner_id and interaction.user.id != int(owner_id):
+        await interaction.response.send_message("Only the bot owner can use this command.", ephemeral=True)
         return
-
-    # Validate aspect_ratio
-    valid_ratios = ["1:1", "16:9", "9:16", "21:9", "9:21"]
-    if aspect_ratio not in valid_ratios:
-        embed = discord.Embed(
-            title="Invalid Aspect Ratio",
-            description=f"Valid aspect ratios: {', '.join(valid_ratios)}",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-        return
-
+    
     try:
-        # Map aspect ratios to Pollinations.ai dimensions
-        aspect_map = {
-            "1:1": (1024, 1024),
-            "16:9": (1024, 576),
-            "9:16": (576, 1024),
-            "21:9": (1024, 438),
-            "9:21": (438, 1024)
-        }
-        width, height = aspect_map.get(aspect_ratio, (1024, 1024))
-
-        # Use Pollinations.ai (free, no API key needed)
-        image_url = f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width={width}&height={height}&model=flux"
-
-        # Download the image
-        response = requests.get(image_url, timeout=30)
-
-        if response.status_code == 200:
-            # The response content is the image binary
-            image_data = response.content
-
-            # Create a file-like object for Discord
-            from io import BytesIO
-            image_file = discord.File(BytesIO(image_data), filename="generated_image.jpeg")
-
-            # Create embed with generated image
-            embed = discord.Embed(
-                title="AI Image Generation (Free)",
-                description=f"**Prompt:** {prompt}",
-                color=discord.Color.blue()
-            )
-            embed.add_field(name="Aspect Ratio", value=aspect_ratio, inline=True)
-            embed.add_field(name="Model", value="Flux (via Pollinations.ai)", inline=True)
-            embed.set_image(url="attachment://generated_image.jpeg")
-            embed.set_footer(text=f"Generated by {ctx.author}")
-
-            await ctx.send(embed=embed, file=image_file)
-        else:
-            embed = discord.Embed(
-                title="Image Generation Error",
-                description=f"Failed to generate image: HTTP {response.status_code}",
-                color=discord.Color.red()
-            )
-            await ctx.send(embed=embed)
-
-    except requests.exceptions.Timeout:
-        embed = discord.Embed(
-            title="Timeout Error",
-            description="Image generation took too long. Please try again.",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
-    except requests.exceptions.RequestException as e:
-        embed = discord.Embed(
-            title="Network Error",
-            description=f"Failed to connect to Pollinations.ai: {str(e)}",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
+        await bot.tree.sync()
+        await interaction.response.send_message("✅ Slash commands synced successfully!")
     except Exception as e:
-        embed = discord.Embed(
-            title="Unexpected Error",
-            description=f"An unexpected error occurred: {str(e)}",
-            color=discord.Color.red()
-        )
-        await ctx.send(embed=embed)
+        await interaction.response.send_message(f"❌ Failed to sync: {e}", ephemeral=True)
 
-# Command: Clear messages
-@bot.command(name='clear', help='Clears specified number of messages')
-@commands.has_permissions(manage_messages=True)
-async def clear(ctx, amount: int):
-    await ctx.channel.purge(limit=amount + 1)
-    await ctx.send(f'{amount} messages have been cleared!', delete_after=5)
-
-# Command: Server info
-@bot.command(name='serverinfo', help='Displays information about the server')
-async def server_info(ctx):
-    guild = ctx.guild
-    embed = discord.Embed(title=f'{guild.name} Server Information', color=discord.Color.blue())
-    embed.add_field(name='Server Owner', value=guild.owner.mention, inline=False)
-    embed.add_field(name='Member Count', value=guild.member_count, inline=True)
-    embed.add_field(name='Channel Count', value=len(guild.channels), inline=True)
-    embed.add_field(name='Server Created', value=guild.created_at.strftime('%B %d, %Y'), inline=False)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    await ctx.send(embed=embed)
-
-# Command: Set status (owner only)
-@bot.command(name='setstatus', help='Owner-only: set bot presence. Usage: j!setstatus <type> [text]')
-@owner_only()
-async def setstatus(ctx, type: str, *, text: str = None):
-    """
-    type: playing | watching | listening | streaming | clear | online | idle | dnd | invisible
-    text: For playing/watching/listening: the activity text.
-          For streaming: use `Name|URL` (pipe-separated) so a url is provided for Streaming activity.
-    """
-    type = type.lower()
-
-    # Status-only changes
-    status_map = {
-        'online': discord.Status.online,
-        'idle': discord.Status.idle,
-        'dnd': discord.Status.dnd,
-        'invisible': discord.Status.invisible,
-    }
-    if type in status_map:
-        await bot.change_presence(status=status_map[type])
-        await ctx.send(f'Status set to {type}.')
+# Slash Command: Close (owner only)
+@bot.tree.command(name='close', description='Shutdown the bot (owner only)')
+async def close_bot(interaction: discord.Interaction):
+    owner_id = os.getenv('OWNER_ID')
+    if owner_id and interaction.user.id != int(owner_id):
+        await interaction.response.send_message("Only the bot owner can use this command.", ephemeral=True)
         return
+    
+    await interaction.response.send_message("🛑 Shutting down bot...")
+    await bot.close()
 
-    # Clear activity
-    if type == 'clear':
-        await bot.change_presence(activity=None)
-        await ctx.send('Cleared activity.')
-        return
 
-    # Activity changes
-    activity = None
-    if type == 'playing':
-        activity = discord.Game(text or "")
-    elif type == 'watching':
-        activity = discord.Activity(type=discord.ActivityType.watching, name=text or "")
-    elif type == 'listening':
-        activity = discord.Activity(type=discord.ActivityType.listening, name=text or "")
-    elif type == 'streaming':
-        # Expect text in form "Name|URL"
-        if not text or '|' not in text:
-            await ctx.send('For streaming, use: j!setstatus streaming Name|URL')
-            return
-        name, url = [s.strip() for s in text.split('|', 1)]
-        activity = discord.Streaming(name=name or "", url=url)
-    else:
-        await ctx.send('Invalid type. Use playing|watching|listening|streaming|clear|online|idle|dnd|invisible')
-        return
 
-    try:
-        await bot.change_presence(activity=activity)
-        await ctx.send(f'Set activity to {type} {f"\"{text}\"" if text else ""}')
-    except Exception as e:
-        await ctx.send(f'Failed to set activity: {e}')
-
-# Command: List all commands
-@bot.command(name='commands', help='Shows all available commands')
-async def commands_list(ctx):
-    # Create the select menu for command categories
-    class CommandSelect(discord.ui.Select):
-        def __init__(self):
-            options = [
-                discord.SelectOption(label="General Commands", description="Fun and utility commands", emoji="📋", value="general"),
-                discord.SelectOption(label="Moderation Commands", description="Server management commands", emoji="🛡️", value="moderation"),
-                discord.SelectOption(label="Owner Commands", description="Bot owner only commands", emoji="👑", value="owner"),
-                discord.SelectOption(label="All Commands", description="View all commands at once", emoji="📚", value="all")
-            ]
-            super().__init__(placeholder="Choose a command category...", min_values=1, max_values=1, options=options)
-
-        async def callback(self, interaction: discord.Interaction):
-            # Check if the user who clicked is the same as the command user
-            if interaction.user != ctx.author:
-                await interaction.response.send_message("Only the person who ran the command can use this menu!", ephemeral=True)
-                return
-
-            selected_value = self.values[0]
-
-            embed = discord.Embed(
-                title="🤖 Joshua's Bot Commands",
-                color=discord.Color.blue()
-            )
-            embed.set_thumbnail(url="https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExb2p6cXNicnEzc3E4eHE1MDM1MXp3Z3lvOG82eW9mbHNqdnkxcnFzMiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/WiIuC6fAOoXD2/giphy.gif")
-
-            if selected_value == "general":
-                general_commands = ""
-                general_commands += "📋 `j!commands` - Shows this list of commands\n"
-                general_commands += "🏓 `j!ping` or `/ping` - Shows bot latency\n"
-                general_commands += "ℹ️ `j!serverinfo` - Shows server information\n"
-                general_commands += "🗣️ `j!talk <message>` - Makes the bot say your message\n"
-                general_commands += "🎙️ `/talk <message>` - Repeats whatever message you send\n"
-                general_commands += "🤖 `/ai <prompt> [image_url]` - Chat with AI (supports text and optional image)\n"
-                general_commands += "🎨 `/image <prompt>` - Generate an image using AI\n"
-                general_commands += "💕 `/ship <user1> <user2>` - Ship two users and rate their love compatibility\n"
-                general_commands += "🐾 `/pet <pet_type>` - Show random images of cute pets\n"
-                general_commands += "😴 `/afk [reason]` - Set yourself as AFK\n"
-                general_commands += "👤 `/info [user]` - Shows profile information and badges\n"
-                general_commands += "👤 `j!info [user]` - Shows profile information and badges (prefix version)\n"
-                general_commands += "🎮 `j!game` or `/game` - Start a word-based minesweeper game\n"
-                general_commands += "🔍 `j!reveal <row> <col>` or `/reveal <row> <col>` - Reveal a cell in the minesweeper game\n"
-                general_commands += "🕵️ `j!hide [choice]` or `/hide [choice]` - Play hide-and-seek with P Diddy\n"
-                embed.add_field(name="📋 General Commands", value=general_commands, inline=False)
-
-            elif selected_value == "moderation":
-                mod_commands = ""
-                mod_commands += "👢 `j!kick @user [reason]` - Kicks a user from the server\n"
-                mod_commands += "🔨 `j!ban @user [reason]` - Bans a user from the server\n"
-                mod_commands += "🔓 `j!unban Username#1234` - Unbans a user\n"
-                mod_commands += "⏰ `j!timeout @user <minutes> [reason]` - Timeout (mute) a user\n"
-                mod_commands += "🔄 `j!untimeout @user [reason]` - Removes timeout from a user\n"
-                mod_commands += "🧹 `j!clear <number>` - Clears specified number of messages\n"
-                embed.add_field(name="🛡️ Moderation Commands", value=mod_commands, inline=False)
-
-            elif selected_value == "owner":
-                owner_commands = ""
-                owner_commands += "⚙️ `j!setstatus <type> [text]` - Set bot presence (owner only)\n"
-                owner_commands += "⏹️ `j!close` - Shutdown the bot (bot owner only)\n"
-                owner_commands += "🤫 `/quiet` - Enable quiet mode (owner only)\n"
-                owner_commands += "🔊 `/unquiet` - Disable quiet mode (owner only)\n"
-                owner_commands += "📢 `/setannounce <channel>` - Set announcement channel for bot online messages\n"
-                embed.add_field(name="👑 Owner Commands", value=owner_commands, inline=False)
-
-            elif selected_value == "all":
-                # General Commands
-                general_commands = ""
-                general_commands += "📋 `j!commands` - Shows this list of commands\n"
-                general_commands += "🏓 `j!ping` or `/ping` - Shows bot latency\n"
-                general_commands += "ℹ️ `j!serverinfo` - Shows server information\n"
-                general_commands += "🗣️ `j!talk <message>` - Makes the bot say your message\n"
-                general_commands += "🎙️ `/talk <message>` - Repeats whatever message you send\n"
-                general_commands += "🤖 `/ai <prompt> [image_url]` - Chat with AI (supports text and optional image)\n"
-                general_commands += "🎨 `/image <prompt>` - Generate an image using AI\n"
-                general_commands += "💕 `/ship <user1> <user2>` - Ship two users and rate their love compatibility\n"
-                general_commands += "🐾 `/pet <pet_type>` - Show random images of cute pets\n"
-                general_commands += "😴 `/afk [reason]` - Set yourself as AFK\n"
-                general_commands += "👤 `/info [user]` - Shows profile information and badges\n"
-                general_commands += "👤 `j!info [user]` - Shows profile information and badges (prefix version)\n"
-                general_commands += "🎮 `j!game` or `/game` - Start a word-based minesweeper game\n"
-                general_commands += "🔍 `j!reveal <row> <col>` or `/reveal <row> <col>` - Reveal a cell in the minesweeper game\n"
-                general_commands += "🕵️ `j!hide [choice]` or `/hide [choice]` - Play hide-and-seek with P Diddy\n"
-                embed.add_field(name="📋 General Commands", value=general_commands, inline=False)
-
-                # Moderation Commands
-                mod_commands = ""
-                mod_commands += "👢 `j!kick @user [reason]` - Kicks a user from the server\n"
-                mod_commands += "🔨 `j!ban @user [reason]` - Bans a user from the server\n"
-                mod_commands += "🔓 `j!unban Username#1234` - Unbans a user\n"
-                mod_commands += "⏰ `j!timeout @user <minutes> [reason]` - Timeout (mute) a user\n"
-                mod_commands += "🔄 `j!untimeout @user [reason]` - Removes timeout from a user\n"
-                mod_commands += "🧹 `j!clear <number>` - Clears specified number of messages\n"
-                embed.add_field(name="🛡️ Moderation Commands", value=mod_commands, inline=False)
-
-                # Owner Commands
-                owner_commands = ""
-                owner_commands += "⚙️ `j!setstatus <type> [text]` - Set bot presence (owner only)\n"
-                owner_commands += "⏹️ `j!close` - Shutdown the bot (bot owner only)\n"
-                owner_commands += "🤫 `/quiet` - Enable quiet mode (owner only)\n"
-                owner_commands += "🔊 `/unquiet` - Disable quiet mode (owner only)\n"
-                owner_commands += "📢 `/setannounce <channel>` - Set announcement channel for bot online messages\n"
-                embed.add_field(name="👑 Owner Commands", value=owner_commands, inline=False)
-
-            # Add usage notes
-            notes = (
-                "```\n"
-                "[] = Optional parameter\n"
-                "<> = Required parameter\n"
-                "@user = Mention a user\n"
-                "All moderation commands require appropriate permissions```"
-            )
-            embed.add_field(name="📝 Usage Notes", value=notes, inline=False)
-
-            # Set footer with timestamp
-            embed.set_footer(text=f"Requested by {ctx.author}", icon_url=ctx.author.display_avatar.url)
-            embed.timestamp = ctx.message.created_at
-
-            await interaction.response.edit_message(embed=embed, view=self.view)
-
-    class CommandView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=300)  # 5 minutes timeout
-            self.add_item(CommandSelect())
-
-    # Send only the interactive dropdown view
-    view = CommandView()
-    await ctx.send(view=view)
-
-# Command: Kick member
-@bot.command(name='kick', help='Kicks a member from the server')
-@commands.has_permissions(kick_members=True)
-async def kick(ctx, member: discord.Member, *, reason=None):
+# Slash Command: Kick
+@bot.tree.command(name='kick', description='Kicks a member from the server')
+@app_commands.checks.has_permissions(kick_members=True)
+@app_commands.describe(member="Member to kick", reason="Reason for kicking")
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = None):
     try:
         await member.kick(reason=reason)
         embed = discord.Embed(
@@ -1201,15 +1423,16 @@ async def kick(ctx, member: discord.Member, *, reason=None):
             color=discord.Color.red()
         )
         embed.add_field(name="Reason", value=reason or "No reason provided")
-        embed.set_footer(text=f"Kicked by {ctx.author}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Kicked by {interaction.user}")
+        await interaction.response.send_message(embed=embed)
     except discord.Forbidden:
-        await ctx.send("I don't have permission to kick members!")
+        await interaction.response.send_message("I don't have permission to kick members!", ephemeral=True)
 
-# Command: Ban member
-@bot.command(name='ban', help='Bans a member from the server')
-@commands.has_permissions(ban_members=True)
-async def ban(ctx, member: discord.Member, *, reason=None):
+# Slash Command: Ban
+@bot.tree.command(name='ban', description='Bans a member from the server')
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(member="Member to ban", reason="Reason for banning")
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = None):
     try:
         await member.ban(reason=reason)
         embed = discord.Embed(
@@ -1218,34 +1441,36 @@ async def ban(ctx, member: discord.Member, *, reason=None):
             color=discord.Color.dark_red()
         )
         embed.add_field(name="Reason", value=reason or "No reason provided")
-        embed.set_footer(text=f"Banned by {ctx.author}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Banned by {interaction.user}")
+        await interaction.response.send_message(embed=embed)
     except discord.Forbidden:
-        await ctx.send("I don't have permission to ban members!")
+        await interaction.response.send_message("I don't have permission to ban members!", ephemeral=True)
 
-# Command: Timeout (mute) member
-@bot.command(name='timeout', help='Timeout (mute) a member for a specified duration (in minutes)')
-@commands.has_permissions(moderate_members=True)
-async def timeout(ctx, member: discord.Member, duration: int, *, reason=None):
+# Slash Command: Timeout
+@bot.tree.command(name='timeout', description='Timeout (mute) a member for a specified duration (in minutes)')
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.describe(member="Member to timeout", duration="Duration in minutes", reason="Reason for timeout")
+async def timeout(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str = None):
     try:
         # Convert duration from minutes to seconds and create timedelta
         duration_seconds = duration * 60
-        await member.timeout_for(datetime.timedelta(seconds=duration_seconds), reason=reason)
+        await member.timeout(datetime.timedelta(seconds=duration_seconds), reason=reason)
         embed = discord.Embed(
             title="⏰ Member Timed Out",
             description=f"{member.mention} has been timed out for {duration} minutes.",
             color=discord.Color.orange()
         )
         embed.add_field(name="Reason", value=reason or "No reason provided")
-        embed.set_footer(text=f"Timed out by {ctx.author}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Timed out by {interaction.user}")
+        await interaction.response.send_message(embed=embed)
     except discord.Forbidden:
-        await ctx.send("I don't have permission to timeout members!")
+        await interaction.response.send_message("I don't have permission to timeout members!", ephemeral=True)
 
-# Command: Remove timeout (unmute) member
-@bot.command(name='untimeout', help='Remove timeout from a member')
-@commands.has_permissions(moderate_members=True)
-async def untimeout(ctx, member: discord.Member, *, reason=None):
+# Slash Command: Untimeout
+@bot.tree.command(name='untimeout', description='Remove timeout from a member')
+@app_commands.checks.has_permissions(moderate_members=True)
+@app_commands.describe(member="Member to untimeout", reason="Reason for removing timeout")
+async def untimeout(interaction: discord.Interaction, member: discord.Member, reason: str = None):
     try:
         await member.remove_timeout(reason=reason)
         embed = discord.Embed(
@@ -1254,43 +1479,67 @@ async def untimeout(ctx, member: discord.Member, *, reason=None):
             color=discord.Color.green()
         )
         embed.add_field(name="Reason", value=reason or "No reason provided")
-        embed.set_footer(text=f"Timeout removed by {ctx.author}")
-        await ctx.send(embed=embed)
+        embed.set_footer(text=f"Timeout removed by {interaction.user}")
+        await interaction.response.send_message(embed=embed)
     except discord.Forbidden:
-        await ctx.send("I don't have permission to remove timeouts!")
+        await interaction.response.send_message("I don't have permission to remove timeouts!", ephemeral=True)
 
-# Command: Unban member
-@bot.command(name='unban', help='Unbans a member from the server')
-@commands.has_permissions(ban_members=True)
-async def unban(ctx, *, member):
+# Slash Command: Unban
+@bot.tree.command(name='unban', description='Unbans a member from the server')
+@app_commands.checks.has_permissions(ban_members=True)
+@app_commands.describe(member="Username or Username#Discriminator of the banned user")
+async def unban(interaction: discord.Interaction, member: str):
     try:
         # Find the banned user
-        banned_users = [entry async for entry in ctx.guild.bans()]
-        member_name, member_discriminator = member.split('#')
-
-        for ban_entry in banned_users:
+        banned_users_list = [entry async for entry in interaction.guild.bans()]
+        
+        # Handle both old format (name#discriminator) and new format (username)
+        if '#' in member:
+            try:
+                member_name, member_discriminator = member.split('#')
+                for ban_entry in banned_users_list:
+                    user = ban_entry.user
+                    if (user.name, str(user.discriminator)) == (member_name, member_discriminator):
+                        await interaction.guild.unban(user)
+                        embed = discord.Embed(
+                            title="🔓 Member Unbanned",
+                            description=f"{user.mention} has been unbanned from the server.",
+                            color=discord.Color.green()
+                        )
+                        embed.set_footer(text=f"Unbanned by {interaction.user}")
+                        await interaction.response.send_message(embed=embed)
+                        return
+            except ValueError:
+                pass
+        
+        # New username format or fallback
+        for ban_entry in banned_users_list:
             user = ban_entry.user
-            if (user.name, user.discriminator) == (member_name, member_discriminator):
-                await ctx.guild.unban(user)
+            if user.name == member or str(user) == member:
+                await interaction.guild.unban(user)
                 embed = discord.Embed(
                     title="🔓 Member Unbanned",
                     description=f"{user.mention} has been unbanned from the server.",
                     color=discord.Color.green()
                 )
-                embed.set_footer(text=f"Unbanned by {ctx.author}")
-                await ctx.send(embed=embed)
+                embed.set_footer(text=f"Unbanned by {interaction.user}")
+                await interaction.response.send_message(embed=embed)
                 return
-        await ctx.send(f"Could not find banned user {member}")
+        
+        await interaction.response.send_message(f"Could not find banned user {member}", ephemeral=True)
     except discord.Forbidden:
-        await ctx.send("I don't have permission to unban members!")
+        await interaction.response.send_message("I don't have permission to unban members!", ephemeral=True)
 
-# Command: Game (Word Minesweeper)
-@bot.command(name='game', help='Play a word-based minesweeper game')
-async def game(ctx):
+# Slash Command: Game (Word Minesweeper)
+@bot.tree.command(name='game', description='Start a word-based minesweeper game')
+async def slash_game(interaction: discord.Interaction):
+    # Defer the response to prevent timeout errors
+    await interaction.response.defer()
+
     # Check if user already has a game
-    user_id = ctx.author.id
+    user_id = interaction.user.id
     if user_id in game_state:
-        await ctx.send("You already have a game in progress! Finish it first.")
+        await interaction.followup.send("You already have a game in progress! Finish it first.")
         return
 
     # Generate a 5x5 grid with words
@@ -1323,15 +1572,20 @@ async def game(ctx):
         description="Find the 5 hidden bombs! Click on a word to reveal it.\n\n" + display_grid,
         color=discord.Color.blue()
     )
-    embed.set_footer(text="Use j!reveal <row> <col> to reveal a cell (1-5)")
-    await ctx.send(embed=embed)
+    embed.set_footer(text="Use /reveal to reveal a cell (1-5)")
+    await interaction.followup.send(embed=embed)
 
-# Command: Reveal cell
-@bot.command(name='reveal', help='Reveal a cell in the game: j!reveal <row> <col>')
-async def reveal(ctx, row: int, col: int):
-    user_id = ctx.author.id
+
+
+# Slash Command: Reveal cell
+@bot.tree.command(name='reveal', description='Reveal a cell in the minesweeper game')
+async def slash_reveal(interaction: discord.Interaction, row: int, col: int):
+    # Defer the response to prevent timeout errors
+    await interaction.response.defer()
+
+    user_id = interaction.user.id
     if user_id not in game_state:
-        await ctx.send("You don't have a game in progress! Start one with j!game")
+        await interaction.followup.send("You don't have a game in progress! Start one with /game")
         return
 
     game = game_state[user_id]
@@ -1339,11 +1593,11 @@ async def reveal(ctx, row: int, col: int):
     col -= 1
 
     if not (0 <= row < 5 and 0 <= col < 5):
-        await ctx.send("Invalid coordinates! Use 1-5 for row and column.")
+        await interaction.followup.send("Invalid coordinates! Use 1-5 for row and column.")
         return
 
     if (row, col) in game['revealed']:
-        await ctx.send("That cell is already revealed!")
+        await interaction.followup.send("That cell is already revealed!")
         return
 
     game['revealed'].add((row, col))
@@ -1356,7 +1610,7 @@ async def reveal(ctx, row: int, col: int):
             description="Ooof! You lost, git gud",
             color=discord.Color.red()
         )
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
         return
 
     # Check win condition
@@ -1369,7 +1623,7 @@ async def reveal(ctx, row: int, col: int):
             description="Congratulations! You found all the safe words!",
             color=discord.Color.green()
         )
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
         return
 
     # Display updated grid
@@ -1387,13 +1641,18 @@ async def reveal(ctx, row: int, col: int):
         description=f"Revealed {revealed_cells} cells. {5 - len(game['bombs'] & game['revealed'])} bombs remaining.\n\n" + display_grid,
         color=discord.Color.blue()
     )
-    embed.set_footer(text="Use j!reveal <row> <col> to reveal a cell (1-5)")
-    await ctx.send(embed=embed)
+    embed.set_footer(text="Use /reveal to reveal a cell (1-5)")
+    await interaction.followup.send(embed=embed)
 
-# Command: Hide (prefix version)
-@bot.command(name='hide', help='Play hide-and-seek with P Diddy: j!hide [choice]')
-async def hide_prefix(ctx, choice: int = None):
-    user_id = ctx.author.id
+
+
+# Slash Command: Hide (P Diddy Hide-and-Seek Game)
+@bot.tree.command(name='hide', description='Play hide-and-seek with P Diddy')
+async def slash_hide(interaction: discord.Interaction, choice: int = None):
+    # Defer the response to prevent timeout errors
+    await interaction.response.defer()
+
+    user_id = interaction.user.id
 
     if choice is None:
         # Display the status and available spots
@@ -1403,22 +1662,596 @@ async def hide_prefix(ctx, choice: int = None):
             description=status,
             color=discord.Color.blue()
         )
-        await ctx.send(embed=embed)
+        await interaction.followup.send(embed=embed)
     else:
         # Run the game logic
         message, _ = run_grand_escape_round(user_id, choice)
-        await ctx.send(message)
+        await interaction.followup.send(message)
+
+
+
+# Note: j!search command removed per user request.
+
+# Slash Command: Pulse (Channel Vibe Check)
+@bot.tree.command(name="pulse", description="Analyzes the current 'vibe' of the channel")
+async def pulse(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    try:
+        # Gather history
+        history = []
+        async for message in interaction.channel.history(limit=50):
+            if not message.author.bot:
+                history.append(f"{message.author.display_name}: {message.content}")
+        
+        if not history:
+            await interaction.followup.send("📊 **Channel Pulse:** No recent messages to analyze!")
+            return
+        
+        chat_context = "\n".join(history)
+        prompt = f"Analyze the following chat log and give a brief 'vibe check' (2 sentences max) and a sentiment percentage:\n\n{chat_context}"
+        
+        analysis = await cerebras_ai_request(prompt)
+        if analysis:
+            await interaction.followup.send(f"📊 **Channel Pulse:**\n{analysis}")
+        else:
+            await interaction.followup.send("📊 **Channel Pulse:** AI analysis is currently unavailable.")
+        
+    except Exception as e:
+        await interaction.followup.send(f"😅 Oops, pulse check went a bit wonky: {str(e)[:50]}... no worries though! 🤷‍♂️")
+
+# Slash Command: Recap
+@bot.tree.command(name='recap', description='Get a recap of topics discussed with AI today')
+async def recap(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    user_id = interaction.user.id
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+
+    if user_id not in user_memory or not user_memory[user_id]:
+        await interaction.followup.send("You haven't had any AI conversations today!")
+        return
+
+    # Filter messages from today
+    todays_messages = [msg for msg in user_memory[user_id] if msg.get('timestamp', datetime.datetime.min).date() == today]
+
+    if not todays_messages:
+        await interaction.followup.send("You haven't had any AI conversations today!")
+        return
+
+    # Collect user prompts from today
+    user_prompts = [msg['content'] for msg in todays_messages if msg['role'] == 'user']
+
+    if not user_prompts:
+        await interaction.followup.send("No user prompts found today.")
+        return
+
+    # Create a summary prompt
+    conversation_text = "\n".join(user_prompts[:10])  # Limit to last 10 to avoid too long
+    summary_prompt = f"Summarize the main topics discussed in these AI conversations today: {conversation_text}"
+
+    # Use AI to summarize
+    recap_text = await cerebras_ai_request(summary_prompt)
+
+    if recap_text:
+        embed = discord.Embed(title="📝 AI Conversation Recap", description=recap_text, color=discord.Color.blue())
+        embed.set_footer(text=f"Recap for {interaction.user.display_name} - Today")
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send("Unable to generate recap right now.")
+
+# Slash Command: Timezone
+@bot.tree.command(name="timezone", description="Convert a time to a dynamic Discord tag for everyone")
+@app_commands.describe(time_input="e.g., 'tomorrow at 5pm' or 'Friday 10:30am'")
+async def timezone(interaction: discord.Interaction, time_input: str):
+    try:
+        dt = parser.parse(time_input, fuzzy=True, default=datetime.datetime.now())
+        unix_time = int(dt.timestamp())
+        discord_tag = f"<t:{unix_time}:F> (<t:{unix_time}:R>)"
+        
+        await interaction.response.send_message(
+            f"🕐 **Time Converted - pretty neat, right?** ✨\nGlobal Tag: `{discord_tag}`\nYour result: {discord_tag} 😎"
+        )
+    except Exception:
+        await interaction.response.send_message("🤔 Hmm, that time format's got me scratching my head... Try something like 'Oct 20 5pm' or 'tomorrow 3pm' and we'll be golden! 😊", ephemeral=True)
+
+# Slash Command: Feedback
+@bot.tree.command(name="feedback", description="Send feedback, bug reports, or ideas directly to the bot owner")
+@app_commands.describe(
+    category="Select the type of feedback",
+    message="Your feedback message", 
+    command_name="Which command failed? (Required for Command execution failure)",
+    anonymous="Send feedback anonymously", 
+    attachment="Optional file attachment"
+)
+@app_commands.choices(category=[
+    app_commands.Choice(name="General Feedback", value="general"),
+    app_commands.Choice(name="Bug Report", value="bug"),
+    app_commands.Choice(name="Feature Request", value="feature"),
+    app_commands.Choice(name="Command execution failure", value="command_error")
+])
+async def feedback(interaction: discord.Interaction, category: app_commands.Choice[str], message: str, command_name: str = None, anonymous: bool = False, attachment: discord.Attachment = None):
+    await interaction.response.defer(ephemeral=True)
+    
+    # Check if command_name is required for command_error category
+    if category.value == "command_error" and not command_name:
+        await interaction.followup.send("🤷‍♂️ Hey, I'm gonna need that command name when reporting failures - helps me figure out what went sideways! 😅", ephemeral=True)
+        return
+    
+    owner_id = int(os.getenv('OWNER_ID', '1231525871257649213'))
+    owner = bot.get_user(owner_id)
+    if not owner:
+        await interaction.followup.send("😬 Can't find the boss anywhere... might wanna slide into their DMs the old school way! 📱😂", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"✨ {category.name}",
+        description=message,
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    
+    if category.value == "command_error":
+        embed.add_field(name="Failed Command", value=f"`{command_name}`", inline=True)
+
+    if not anonymous:
+        embed.set_author(name=interaction.user, icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+        user_text = f"From **{interaction.user}** ({interaction.user.id})"
+    else:
+        embed.set_author(name="Anonymous User")
+        user_text = f"From User ID: {interaction.user.id}"
+
+    server = interaction.guild.name if interaction.guild else "Direct Messages"
+    embed.add_field(name="Server", value=server, inline=True)
+    embed.add_field(name="User", value=user_text, inline=True)
+
+    files = []
+    if attachment:
+        file = await attachment.to_file()
+        files.append(file)
+        embed.set_image(url=f"attachment://{file.filename}")
+
+    await owner.send(embed=embed, files=files)
+    await interaction.followup.send("🚀 Boom! Feedback delivered straight to the boss's inbox! Thanks for keeping it real ❤️✨", ephemeral=True)
+
+# Slash Command: Topic
+@bot.tree.command(name='topic', description='Get a random conversation starter')
+async def topic(interaction: discord.Interaction):
+    topics = [
+        "What is the most underrated movie of all time?",
+        "If you could have dinner with any historical figure, who would it be?",
+        "What's the weirdest food combination you actually enjoy?",
+        "If you won the lottery tomorrow, what's the first thing you'd buy?",
+        "What is your 'hot take' that everyone else disagrees with?",
+        "What's a hobby you've always wanted to pick up but haven't?"
+    ]
+    selected_topic = random.choice(topics)
+    await interaction.response.send_message(f"💭 **Here's something to chat about:** {selected_topic} 🤔✨")
+
+# Slash Command: Remind
+@bot.tree.command(name='remind', description='Set a reminder')
+@app_commands.describe(seconds="How many seconds until the reminder?", task="What should I remind you about?")
+async def remind(interaction: discord.Interaction, seconds: int, task: str):
+    await interaction.response.send_message(f"📝 Got it! I'll ping you about '{task}' in {seconds} seconds - don't worry, I won't forget! 😉⏰")
+    
+    # Create a background task for the reminder
+    async def send_reminder():
+        await asyncio.sleep(seconds)
+        try:
+            await interaction.followup.send(f"🔔 **Yo {interaction.user.mention}!** Time's up for: {task} ⏰✨")
+        except:
+            pass  # Ignore if followup fails
+    
+    # Start the reminder task in the background
+    asyncio.create_task(send_reminder())
+
+# Warnings storage
+user_warnings = {}
+
+# Slash Command: Warnings
+@bot.tree.command(name='warnings', description='Display warnings for a user')
+@app_commands.describe(user="User to check warnings for")
+async def warnings(interaction: discord.Interaction, user: discord.Member):
+    guild_id = interaction.guild.id
+    user_id = user.id
+
+    warnings_list = user_warnings.get(guild_id, {}).get(user_id, [])
+
+    embed = discord.Embed(title=f"Warnings for {user.display_name}", color=discord.Color.orange())
+    
+    if not warnings_list:
+        embed.description = "No warnings found for this user."
+    else:
+        for idx, warning in enumerate(warnings_list, 1):
+            # Assuming warning structure is dict or string. 
+            # Based on previous code it seemed to be just strings or objects.
+            # Adapting to generic display:
+            embed.add_field(name=f"Warning {idx}", value=str(warning), inline=False)
+            
+    embed.set_footer(text=f"Requested by {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+
+
+# Slash Command: YouTube Search
+@bot.tree.command(name='youtube', description='Search YouTube videos')
+@app_commands.describe(query="What to search for on YouTube")
+async def youtube_search(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+    
+    if not youtube:
+        await interaction.followup.send("❌ YouTube API not configured")
+        return
+    
+    try:
+        results = await asyncio.to_thread(search_youtube, query)
+        if isinstance(results, str):
+            await interaction.followup.send(f"❌ {results}")
+            return
+        
+        if not results:
+            await interaction.followup.send("❌ No videos found")
+            return
+        
+        # Create embed for first result
+        result = results[0]
+        embed = discord.Embed(
+            title=result['title'],
+            description=f"Uploaded by **{result['channel']}**\n{result['url']}",
+            color=0xff0000
+        )
+        embed.set_author(name=f"Page 1 of {len(results)}")
+        embed.set_image(url=result['thumbnail'])
+        embed.set_footer(text=f"Searched by {interaction.user}")
+        
+        view = YouTubeView(results)
+        await interaction.followup.send(embed=embed, view=view)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Search failed: {str(e)[:50]}...")
+
+# Slash Command: Daily (for badge activity)
+@bot.tree.command(name='daily', description='Get your daily motivation!')
+async def daily(interaction: discord.Interaction):
+    try:
+        with open('daily_index.txt', 'r', encoding='utf-8') as f:
+            quotes = [line.strip() for line in f if line.strip()]
+        if not quotes:
+            await interaction.response.send_message("No quotes available right now!")
+            return
+    except FileNotFoundError:
+        await interaction.response.send_message("Quotes file not found!")
+        return
+
+    # Load current index
+    try:
+        with open('current_daily_index.txt', 'r') as f:
+            current_index = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        current_index = 0
+
+    # Get the quote
+    quote = quotes[current_index]
+
+    # Update index for next time
+    next_index = (current_index + 1) % len(quotes)
+    with open('current_daily_index.txt', 'w') as f:
+        f.write(str(next_index))
+
+    await interaction.response.send_message(quote)
+
+# Slash Command: AFK
+@bot.tree.command(name='afk', description='Add [AFK] to your nickname with optional reason')
+@app_commands.describe(reason="Optional reason for being AFK")
+async def afk(interaction: discord.Interaction, reason: str = None):
+
+    try:
+        user_id = interaction.user.id
+        if user_id in afk_users:
+            await interaction.response.send_message("😴 You're already marked as AFK! 💤", ephemeral=True)
+            return
+
+        current_nick = interaction.user.display_name
+        afk_users[user_id] = {'original_nick': current_nick, 'reason': reason}
+
+        if reason:
+            new_nick = f"[AFK] {reason}"
+            await interaction.response.send_message(f"😴 You're now marked as AFK: {reason}! Sweet dreams! 💤✨")
+        else:
+            new_nick = f"[AFK] {current_nick}"
+            await interaction.response.send_message("😴 You're now marked as AFK! Sweet dreams! 💤✨")
+
+        await interaction.user.edit(nick=new_nick)
+    except discord.Forbidden:
+        await interaction.response.send_message("😅 I don't have permission to change your nickname... ask an admin to hook me up! 🤷♂️", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"😬 Something went wrong: {str(e)}", ephemeral=True)
+
+# Slash Command: Countdown
+@bot.tree.command(name='countdown', description='Start a live countdown timer')
+@app_commands.describe(
+    days="Number of days",
+    hours="Number of hours",
+    minutes="Number of minutes",
+    seconds="Number of seconds",
+    year="Target year (optional)",
+    month="Target month 1-12 (optional)",
+    day="Target day (optional)"
+)
+async def countdown(interaction: discord.Interaction, days: int = 0, hours: int = 0, minutes: int = 0, seconds: int = 0, year: int = None, month: int = None, day: int = None):
+    if year and month and day:
+        try:
+            target_date = datetime.datetime(year, month, day)
+            timestamp = int(target_date.timestamp())
+            await interaction.response.send_message(f"🎯 Your event is happening <t:{timestamp}:R> - mark your calendar! 📅✨")
+            return
+        except ValueError:
+            await interaction.response.send_message("📅 That date's looking a bit funky... double-check those numbers for me! 😅", ephemeral=True)
+            return
+
+    total_seconds = (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+
+    if total_seconds <= 0:
+        await interaction.response.send_message("⏱️ I'm gonna need some actual time to count down from... zero doesn't really work here! 😄", ephemeral=True)
+        return
+
+    # Calculate target timestamp
+    now = datetime.datetime.now(datetime.timezone.utc)
+    target_time = now + datetime.timedelta(seconds=total_seconds)
+    timestamp = int(target_time.timestamp())
+
+    await interaction.response.send_message(f"🚀 **Countdown started!**\nTime remaining: <t:{timestamp}:R>\nEnds at: <t:{timestamp}:T>")
+
+    await asyncio.sleep(total_seconds)
+
+    try:
+        await interaction.edit_original_response(content=f"🎉 **Time's up!** Finished <t:{timestamp}:R>! ⏰✨")
+        await interaction.followup.send(f"🔔 Ding ding! {interaction.user.mention}, your countdown just wrapped up! 🎯✨")
+    except discord.NotFound:
+        pass
+
+# Slash Command: Debate
+@bot.tree.command(name='debate', description='The bot argues with itself over a topic')
+async def debate(interaction: discord.Interaction, topic: str):
+    await interaction.response.defer()  # AI takes a few seconds
+
+    if not gemini_model:
+        await interaction.followup.send("Debate feature is not available - Gemini API key not configured.")
+        return
+
+    prompt = (f"Write a short, heated debate about '{topic}'. "
+              "Provide 'Side A' and 'Side B' separately. Keep each side under 300 characters.")
+
+    response = await asyncio.to_thread(gemini_model.generate_content, prompt)
+    # Simple split logic - you can get fancier with regex
+    text = response.text
+
+    embed = discord.Embed(title=f"⚖️ The Great Debate: {topic}", color=0x2b2d31)
+    embed.description = text
+    embed.set_footer(text="Who won? React with 🔴 or 🔵")
+
+    message = await interaction.followup.send(embed=embed)
+    await message.add_reaction("🔴")
+    await message.add_reaction("🔵")
+
+# Slash Command: Impulse
+@bot.tree.command(name='impulse', description='Drops a hot take and freezes the chat')
+@app_commands.checks.has_permissions(manage_channels=True)
+async def impulse(interaction: discord.Interaction):
+    takes = [
+        "Water is not wet. It makes things wet.",
+        "The letter 'W' starts with a 'D'. Why?",
+        "If we admit that tomatoes are fruits, we must admit ketchup is a smoothie.",
+        "Pineapple on pizza is a culinary masterpiece."
+    ]
+
+    hot_take = random.choice(takes)
+    channel = interaction.channel
+    everyone = interaction.guild.default_role
+
+    # 1. Lock the channel
+    await channel.set_permissions(everyone, send_messages=False)
+
+    await interaction.response.send_message(
+        f"🚨 **IMPULSE TOPIC:** \n> {hot_take}\n\n*Chat frozen for 15s. Process your emotions.*"
+    )
+
+    # 2. The Timer
+    await asyncio.sleep(15)
+
+    # 3. Unlock the channel
+    await channel.set_permissions(everyone, send_messages=None)  # Reset to default
+    await interaction.followup.send("🔓 **UNLOCKED.** Let the chaos begin.")
+
+# Error handling if user doesn't have permissions
+@impulse.error
+async def impulse_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You don't have permission to freeze the chat!", ephemeral=True)
+
+
+
+# Safe send function to handle Discord's 2000 character limit
+async def safe_send(ctx, content):
+    # Discord has a 2000 character limit per message
+    if len(content) > 2000:
+        await ctx.send("📝 Whoa, that result's way too chunky for one message! Maybe try something shorter? 😅")
+    else:
+        await ctx.send(content)
+
+# Slash Command: Help
+@bot.tree.command(name='help', description='Show all available commands')
+async def show_commands(interaction: discord.Interaction):
+    class CommandSelect(discord.ui.Select):
+        def __init__(self):
+            options = [
+                discord.SelectOption(label="🎮 Fun & Games", description="Games, jokes, pets, debates", emoji="🎮"),
+                discord.SelectOption(label="🤖 AI & Chat", description="AI chat, TTS, image analysis", emoji="🤖"),
+                discord.SelectOption(label="🖼️ Media", description="Images, YouTube, daily quotes", emoji="🖼️"),
+                discord.SelectOption(label="⚙️ Utility", description="Ping, reminders, timezone", emoji="⚙️"),
+                discord.SelectOption(label="🔧 Administration", description="Bot settings, channels", emoji="🔧"),
+                discord.SelectOption(label="🛡️ Moderation", description="Kick, ban, purge, warnings", emoji="🛡️"),
+                discord.SelectOption(label="ℹ️ Information", description="Server info, user profiles", emoji="ℹ️")
+            ]
+            super().__init__(placeholder="Choose a command category...", options=options)
+
+        async def callback(self, interaction: discord.Interaction):
+            selected = self.values[0]
+            if selected == "🎮 Fun & Games":
+                embed = discord.Embed(title="🎮 Fun & Games Commands", color=discord.Color.gold())
+                embed.description = (
+                    "```/ship <user1> <user2> - Check compatibility between two users\n"
+                    "/pet <animal> - Pet a specific animal (dog, cat, bunny, panda)\n"
+                    "/joke - Tell a random joke\n"
+                    "/topic - Get a random conversation starter\n"
+                    "/game - Start a word-based minesweeper game\n"
+                    "/reveal <row> <col> - Reveal a cell in the minesweeper game\n"
+                    "/hide [choice] - Play hide-and-seek with P Diddy\n"
+                    "/impulse - Drops a hot take and freezes the chat\n"
+                    "/debate <topic> - The bot argues with itself over a topic```"
+                )
+            elif selected == "🤖 AI & Chat":
+                embed = discord.Embed(title="🤖 AI & Chat Commands", color=discord.Color.blue())
+                embed.description = (
+                    "```/ai <prompt> [attachment] - Chat with AI (supports text and optional image)\n"
+                    "/talk <message> - Text-to-speech using ElevenLabs\n"
+                    "/describe <attachment> - Describe an attached image using AI\n"
+                    "/pulse - Analyzes the current 'vibe' of the channel\n"
+                    "/recap - Get a recap of topics discussed with AI today```"
+                )
+            elif selected == "🖼️ Media":
+                embed = discord.Embed(title="🖼️ Media Commands", color=discord.Color.purple())
+                embed.description = (
+                    "```/image <prompt> - Generate an image using AI\n"
+                    "/youtube <query> - Search YouTube videos\n"
+                    "/daily - Get your daily motivation quote```"
+                )
+            elif selected == "⚙️ Utility":
+                embed = discord.Embed(title="⚙️ Utility Commands", color=discord.Color.green())
+                embed.description = (
+                    "```/ping - Responds with the bot's latency\n"
+                    "/timezone <time_input> - Convert a time to a dynamic Discord tag\n"
+                    "/remind <seconds> <task> - Set a reminder\n"
+                    "/countdown [days] [hours] [minutes] [seconds] - Start a live countdown timer\n"
+                    "/feedback <category> <message> [command_name] [anonymous] [attachment] - Send feedback\n"
+                    "/afk [reason] - Add [AFK] to your nickname```"
+                )
+            elif selected == "🔧 Administration":
+                embed = discord.Embed(title="🔧 Administration Commands", color=discord.Color.orange())
+                embed.description = (
+                    "```/setannounce <channel> - Set the announcement channel\n"
+                    "/invite-track <channel> - Set the welcome channel\n"
+                    "/invites - View invite statistics for the server\n"
+                    "/quiet - Enable quiet mode (owner only)\n"
+                    "/unquiet - Disable quiet mode (owner only)\n"
+                    "/setstatus <status> - Set bot status (owner only)\n"
+                    "/sync - Sync slash commands (owner only)\n"
+                    "/close - Shutdown the bot (owner only)```"
+                )
+            elif selected == "🛡️ Moderation":
+                embed = discord.Embed(title="🛡️ Moderation Commands", color=discord.Color.red())
+                embed.description = (
+                    "```/purge <amount> - Clears specified number of messages\n"
+                    "/kick <member> [reason] - Kicks a member from the server\n"
+                    "/ban <member> [reason] - Bans a member from the server\n"
+                    "/timeout <member> <duration> [reason] - Timeout (mute) a member\n"
+                    "/untimeout <member> [reason] - Remove timeout from a member\n"
+                    "/unban <member> - Unbans a member from the server\n"
+                    "/warnings <user> - Display warnings for a user```"
+                )
+            elif selected == "ℹ️ Information":
+                embed = discord.Embed(title="ℹ️ Information Commands", color=discord.Color.teal())
+                embed.description = (
+                    "```/serverinfo - Displays information about the server\n"
+                    "/info [member] - Shows profile information and badges for a user\n"
+                    "/recover - Recover the last deleted message in this channel (admin/owner only)\n"
+                    "/help - Show this command list```"
+                )
+
+            embed.set_thumbnail(url="https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExaTJ3aWVpa2o2dW5sM3htZzBlNmc2bG4wMHkycXp5NHVjZWE0cTF0NCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/WiIuC6fAOoXD2/giphy.gif")
+            await interaction.response.edit_message(embed=embed, view=self.view)
+
+    class CommandView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+            self.add_item(CommandSelect())
+
+    embed = discord.Embed(title="🤖 Bot Help", description="Select a category below to see all commands!", color=discord.Color.purple())
+    embed.set_thumbnail(url="https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExaTJ3aWVpa2o2dW5sM3htZzBlNmc2bG4wMHkycXp5NHVjZWE0cTF0NCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/WiIuC6fAOoXD2/giphy.gif")
+    view = CommandView()
+    await interaction.response.send_message(embed=embed, view=view)
+
+# Event: AutoMod Action Logging
+@bot.event
+async def on_automod_action_execution(payload):
+    """Logs when a Native AutoMod rule is triggered"""
+    log_channel = discord.utils.get(payload.guild.channels, name="mod-logs")
+    if log_channel:
+        embed = discord.Embed(title="AutoMod Action", color=discord.Color.orange())
+        embed.add_field(name="User", value=f"<@{payload.user_id}>")
+        embed.add_field(name="Rule", value=payload.rule_name)
+        embed.add_field(name="Action", value=payload.action.type.name)
+        embed.set_footer(text=f"Triggered in #{payload.channel_id}")
+        await log_channel.send(embed=embed)
 
 # Error handling
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.errors.CheckFailure):
-        await ctx.send('You do not have the required permissions to use this command.')
-    elif isinstance(error, commands.errors.MissingRequiredArgument):
-        await ctx.send('Please provide all required arguments.')
-    else:
-        await ctx.send(f'An error occurred: {str(error)}')
+    """
+    This event is triggered whenever a command raises an error.
+    """
+    # Prevent any commands with local handlers from being handled here
+    if hasattr(ctx.command, 'on_error'):
+        return
 
+    # Allows us to check for original exceptions raised and sent to CommandInvokeError.
+    # If nothing is found. We keep the exception passed to on_command_error.
+    error = getattr(error, 'original', error)
+
+    # Case: Command not found
+    if isinstance(error, commands.CommandNotFound):
+        return # Usually best to ignore this to avoid spamming the chat
+
+    # Case: Missing required arguments (e.g., !ban without a user)
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: Please specify `{error.param.name}`.")
+
+    # Case: User doesn't have permission (e.g., trying to kick without Admin)
+    elif isinstance(error, commands.MissingPermissions):
+        perms = ", ".join(error.missing_permissions)
+        await ctx.send(f"🚫 You don't have permission to do that! (Missing: {perms})")
+
+    # Case: Bot doesn't have permission
+    elif isinstance(error, commands.BotMissingPermissions):
+        perms = ", ".join(error.missing_permissions)
+        await ctx.send(f"⚠️ I can't do that. I need the `{perms}` permission.")
+
+    # Case: Command is on cooldown
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ Slow down! Try again in {error.retry_after:.2f} seconds.")
+
+    # Case: Bad Argument (e.g., passing a string where a number is expected)
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("📋 Invalid argument. Please check your input and try again.")
+
+    # Case: Catch-all for everything else
+    else:
+        print(f'Ignoring exception in command {ctx.command}:', error)
+        await ctx.send("🆘 An unexpected error occurred. My developers have been notified.")
+
+# Run the bot
 if __name__ == "__main__":
-    # Start the Discord bot
-    bot.run(DISCORD_BOT_TOKEN)
+    # Load environment variables
+    load_dotenv()
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    
+    if not TOKEN:
+        print("Error: DISCORD_TOKEN not found in .env file")
+        exit(1)
+    
+    try:
+        bot.run(TOKEN)
+    except discord.LoginFailure as e:
+        print(f"Failed to log in: {e}")
+        print("Please check your DISCORD_TOKEN in the .env file. It might be invalid or expired.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
